@@ -1,25 +1,5 @@
 #pragma once
 
-#if __has_include("secrets.h")
-#include "secrets.h"
-#endif
-
-#ifndef WIFI_SSID_VALUE
-#define WIFI_SSID_VALUE "CHANGE_ME_WIFI_SSID"
-#endif
-
-#ifndef WIFI_PASSWORD_VALUE
-#define WIFI_PASSWORD_VALUE "CHANGE_ME_WIFI_PASSWORD"
-#endif
-
-#ifndef TRUCK_DATA_URL_VALUE
-#define TRUCK_DATA_URL_VALUE "http://192.168.1.100:25555"
-#endif
-
-#ifndef OTA_PASSWORD
-#define OTA_PASSWORD "CHANGE_ME_OTA_PASSWORD"
-#endif
-
 // ==================== Libraries ====================
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -55,3 +35,4 @@ extern char          timeStr[9];
 
 // ==================== OTA ====================
 #define OTA_HOSTNAME  "ets2-dash"
+#define OTA_PASSWORD  "ets2ota"      // ← đổi mật khẩu; phải khớp upload_flags --auth= trong platformio.ini

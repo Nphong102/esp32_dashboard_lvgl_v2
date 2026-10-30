@@ -212,7 +212,7 @@ void WiFiTask(void* parameter) {
         }
 
         if (millis() - lastTelemetryMs >= TELEMETRY_TIMEOUT_MS) {
-            enterLowPowerSleep("No active telemetry for 5 minutes");
+            enterLowPowerSleep("Telemetry timeout reached");
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
