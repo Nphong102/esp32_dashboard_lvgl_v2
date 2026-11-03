@@ -5,11 +5,16 @@
 
 #include "config.h"
 #include "data_types.h"
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#include "secrets.h.example"
+#endif
 
 // ── WiFi ────────────────────────────────────────────────────
-char        WIFI_SSID[]    = "49 BIEN CUONG T2";
-const char* WIFI_PASSWORD  = "123456789@";
-const char* TRUCK_DATA_URL = "http://192.168.222.49:25555";
+char        WIFI_SSID[33]       = WIFI_SSID_VALUE;
+char        WIFI_PASSWORD[65]  = WIFI_PASSWORD_VALUE;
+char        TRUCK_DATA_URL[193] = TRUCK_DATA_URL_VALUE;
 
 // ── Hardware ────────────────────────────────────────────────
 TFT_eSPI tft = TFT_eSPI();

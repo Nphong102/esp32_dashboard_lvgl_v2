@@ -1,7 +1,7 @@
 /**
  * main.cpp — ETS2 Dashboard (minimal: WiFi + LVGL TFT)
  *
- * Core 0: WiFiTask  — fetch telemetry mỗi 200ms
+ * Core 0: WiFiTask  — nhận telemetry UDP
  * Core 1: DisplayTask — LVGL render mỗi 10ms
  */
 
@@ -9,10 +9,49 @@
 #include "data_types.h"
 #include "wifi_task.h"
 #include "display_task.h"
+#include "rescue_task.h"
 #include <esp_sleep.h>
+
+struct BuzzerNote {
+    uint16_t frequencyHz;
+    uint16_t durationMs;
+};
+
+static void playBuzzerNote(const BuzzerNote& note) {
+    ledcWriteTone(BUZZER_LEDC_CHANNEL, note.frequencyHz);
+    delay(note.durationMs);
+    ledcWrite(BUZZER_LEDC_CHANNEL, 0);
+    delay(35);
+}
+
+void playStartupCompletionMelody() {
+    Serial.println("[BUZZER] Startup: completion melody");
+    const BuzzerNote startupMelody[] = {
+        {659, 120}, {784, 120}, {1047, 180}, {784, 100}, {1047, 360}
+    };
+    for (const BuzzerNote& note : startupMelody) playBuzzerNote(note);
+}
+
+static void playTimerWakeMelody() {
+    Serial.println("[BUZZER] Timer wake: short quiet beep");
+    ledcWriteTone(BUZZER_LEDC_CHANNEL, 1047);
+    ledcWrite(BUZZER_LEDC_CHANNEL, 18);
+    delay(50);
+    ledcWrite(BUZZER_LEDC_CHANNEL, 0);
+}
 
 void setup() {
     Serial.begin(115200);
+    const bool timerWake = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+    initializeRealTimeClock(timerWake);
+    if (!timerWake &&
+        !startRescueButtonMonitor()) {
+        Serial.println("[RESCUE] Could not start BOOT button monitor");
+    }
+    ledcSetup(BUZZER_LEDC_CHANNEL, 1047, 8);
+    ledcAttachPin(BUZZER_PIN, BUZZER_LEDC_CHANNEL);
+    ledcWrite(BUZZER_LEDC_CHANNEL, 0);
+    if (timerWake) playTimerWakeMelody();
     delay(1000);
     Serial.println("\n=============================");
     Serial.println(" ETS2 Dashboard — Booting...");
@@ -28,11 +67,15 @@ void setup() {
     }
     Serial.println("[OK] Mutex created");
 
-    // 2a. WiFi bắt đầu kết nối nền (không chặn) — boot screen sẽ hiển thị trạng thái thật
-    wifiBegin();
+    loadSavedNetworkSettings();
+
+    // 2a. WiFi bắt đầu kết nối nền trừ khi rescue mode đã được chọn.
+    if (!isRescueModeActive()) {
+        wifiBegin();
+    }
 
     // Khi tỉnh bằng timer, kiểm tra telemetry trước để tránh bật TFT nếu vẫn mất kết nối.
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+    if (timerWake) {
         Serial.println("[POWER] Timer wake; checking telemetry before starting display");
         const uint32_t connectStarted = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - connectStarted < 10000) {
@@ -41,11 +84,9 @@ void setup() {
 
         bool telemetryFound = false;
         if (WiFi.status() == WL_CONNECTED) {
-            const uint32_t checkStarted = millis();
-            while (!telemetryFound && millis() - checkStarted < 3000) {
-                telemetryFound = fetchTruckData();
-                if (!telemetryFound) delay(200);
-            }
+            sendBatteryVoltageUdpReport();
+            telemetryFound =
+                waitForTelemetryUdp(TELEMETRY_UDP_WAKE_TIMEOUT_MS);
         }
 
         if (!telemetryFound) {
@@ -92,8 +133,8 @@ void loop() {
         lastPrint = millis();
         Serial.printf("[heap] free=%d  psram=%d\n",
                       ESP.getFreeHeap(), ESP.getFreePsram());
-        Serial.printf("DisplayTask stack free: %d\n", uxTaskGetStackHighWaterMark(DisplayTaskHandle));
-
+        Serial.printf("DisplayTask stack free: %d\n",
+                      uxTaskGetStackHighWaterMark(DisplayTaskHandle));
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
 }

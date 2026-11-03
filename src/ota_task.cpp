@@ -9,6 +9,7 @@
 
 volatile uint8_t otaState = 0;
 volatile uint8_t otaPct   = 0;
+volatile bool webUpdateInProgress = false;
 
 static bool otaStarted = false;
 
@@ -39,6 +40,7 @@ static void otaBegin() {
 }
 
 void otaService() {
+    if (webUpdateInProgress) return;
     if (WiFi.status() != WL_CONNECTED) return;
     if (!otaStarted) { otaBegin(); otaStarted = true; }
     ArduinoOTA.handle();     // khi có phiên nạp, hàm này chạy tới khi xong rồi tự reboot

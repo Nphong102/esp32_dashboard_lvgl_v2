@@ -16,8 +16,10 @@
 #include "display_task.h"
 #include "wifi_task.h"
 #include "ota_task.h"
+#include "rescue_task.h"
 #include "font/myfont.h"
 #include <esp_ota_ops.h>
+#include <esp_sleep.h>
 LV_IMG_DECLARE(q_res);  
 LV_IMG_DECLARE(x);
 LV_IMG_DECLARE(x_1);
@@ -30,6 +32,10 @@ LV_IMG_DECLARE(IMG_1388_resized_320x240);
 LV_IMG_DECLARE(ribi2);
 LV_IMG_DECLARE(ribi3); 
 LV_IMG_DECLARE(park); 
+LV_IMG_DECLARE(left);
+LV_IMG_DECLARE(right);
+LV_IMG_DECLARE(_40x30_hightbeam);
+LV_IMG_DECLARE(_40x30_lowbeam);
  /* forward-declare the symbol */
 #if LV_FONT_MONTSERRAT_16
 #pragma message "LV_FONT_MONTSERRAT_48 is enabled"
@@ -47,15 +53,97 @@ static lv_disp_drv_t      disp_drv;
 
 static lv_color_t *lvgl_buf1 = nullptr;     // cấp phát từ PSRAM trong setupDisplay()
 static lv_color_t *lvgl_buf2 = nullptr;
+static bool in_idle = false;
+static bool displayTimingActive = false;
+static uint32_t cycleFlushUs = 0;
+static uint32_t cycleFlushCount = 0;
+static uint32_t cycleTelemetryUpdatedAtUs = 0;
+static uint32_t cycleTelemetryGeneration = 0;
+static bool cycleTelemetrySnapshotValid = false;
+static uint32_t lastLatencyGeneration = 0;
+static bool hasLatencyGeneration = false;
+
+struct DisplayTimingWindow {
+    uint32_t count = 0;
+    uint64_t totalUs = 0;
+    uint32_t maxUs = 0;
+};
+
+static DisplayTimingWindow uiTiming;
+static DisplayTimingWindow lvglTiming;
+static DisplayTimingWindow flushTiming;
+static DisplayTimingWindow telemetryToFlushTiming;
+static uint32_t displayTimingCycles = 0;
+
+static void recordDisplayTiming(DisplayTimingWindow& window, uint32_t elapsedUs) {
+#if ENABLE_TIMING_LOGS
+    window.count++;
+    window.totalUs += elapsedUs;
+    if (elapsedUs > window.maxUs) window.maxUs = elapsedUs;
+#else
+    (void)window;
+    (void)elapsedUs;
+#endif
+}
+
+static void reportDisplayTiming(const char* name, const DisplayTimingWindow& window) {
+#if ENABLE_TIMING_LOGS
+    if (window.count == 0) {
+        Serial.printf("[TIMING] %s n=0\n", name);
+        return;
+    }
+
+    Serial.printf("[TIMING] %s n=%lu avg=%lu max=%lu us\n",
+                  name,
+                  (unsigned long)window.count,
+                  (unsigned long)(window.totalUs / window.count),
+                  (unsigned long)window.maxUs);
+#else
+    (void)name;
+    (void)window;
+#endif
+}
+
+static void reportDisplayTimingWindow() {
+#if ENABLE_TIMING_LOGS
+    Serial.printf("[TIMING] Display window: %lu cycles\n",
+                  (unsigned long)displayTimingCycles);
+    reportDisplayTiming("UI update", uiTiming);
+    reportDisplayTiming("LVGL handler", lvglTiming);
+    reportDisplayTiming("TFT flush per dirty frame", flushTiming);
+    reportDisplayTiming("Telemetry update -> TFT flush", telemetryToFlushTiming);
+#endif
+
+    uiTiming = DisplayTimingWindow{};
+    lvglTiming = DisplayTimingWindow{};
+    flushTiming = DisplayTimingWindow{};
+    telemetryToFlushTiming = DisplayTimingWindow{};
+    displayTimingCycles = 0;
+}
+
 // ====================== BOOT ANIMATION ======================
 static lv_obj_t *boot_scr = nullptr;
 static lv_obj_t *img_scr = nullptr;
 static lv_obj_t *boot_label = nullptr;
 static lv_obj_t *boot_progress = nullptr;
 static lv_obj_t *boot_status = nullptr;
+static lv_obj_t *boot_rescue_indicator = nullptr;
 static lv_obj_t *test ;
 // ====================== BOOT LOG HELPER ======================
 static lv_obj_t *boot_log = nullptr;
+
+static void updateBootRescueIndicator() {
+    if (boot_rescue_indicator &&
+        isRescueModeActive() &&
+        lv_obj_has_flag(boot_rescue_indicator, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_clear_flag(boot_rescue_indicator, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void bootLvglHandler() {
+    lv_timer_handler();
+    updateBootRescueIndicator();
+}
 
 // Thêm 1 dòng log kiểu BIOS: [OK] Tên  thông-tin  + cập nhật progress
 // tag: "OK" xanh | "WARN" vàng | "FAIL" đỏ
@@ -74,7 +162,7 @@ static void bootLine(const char *tag, const char *name, const char *info, int pc
 
     // Vẽ ngay + chờ một chút cho mắt kịp đọc
     uint32_t t0 = millis();
-    while (millis() - t0 < 110) { lv_timer_handler(); delay(5); }
+    while (millis() - t0 < 110) { bootLvglHandler(); delay(5); }
 }
 
 void showBootSequence() {
@@ -136,6 +224,18 @@ void showBootSequence() {
     lv_obj_align(boot_status, LV_ALIGN_BOTTOM_MID, 0, -12);
     lv_label_set_text(boot_status, "Initializing...");
 
+    boot_rescue_indicator = lv_label_create(boot_scr);
+    lv_obj_set_size(boot_rescue_indicator, 72, 18);
+    lv_obj_align(boot_rescue_indicator, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_set_style_text_font(boot_rescue_indicator, &roboto, 0);
+    lv_obj_set_style_text_color(boot_rescue_indicator, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(boot_rescue_indicator, lv_color_hex(0xD00000), 0);
+    lv_obj_set_style_bg_opa(boot_rescue_indicator, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_align(boot_rescue_indicator, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(boot_rescue_indicator, 4, 0);
+    lv_label_set_text(boot_rescue_indicator, "RESCUE");
+    lv_obj_add_flag(boot_rescue_indicator, LV_OBJ_FLAG_HIDDEN);
+
     // ── Logo 1 ────────────────────────────────────────────────
     lv_obj_t *logo_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(logo_scr, lv_color_black(), 0);
@@ -145,7 +245,7 @@ void showBootSequence() {
     lv_scr_load_anim(logo_scr, LV_SCR_LOAD_ANIM_FADE_IN, 500, 0, false);
     Serial.printf("anh 1 load  psram=%d\n", ESP.getFreePsram());
     unsigned long t = millis();
-    while (millis() - t < 2000) { lv_task_handler(); delay(5); }
+    while (millis() - t < 2000) { bootLvglHandler(); delay(5); }
 
     // ── Logo 2 ────────────────────────────────────────────────
     lv_obj_t *scr_x = lv_obj_create(NULL);
@@ -156,12 +256,12 @@ void showBootSequence() {
     lv_scr_load_anim(scr_x, LV_SCR_LOAD_ANIM_OVER_RIGHT, 500, 0, false);
     Serial.printf("anh 2  load  psram=%d\n", ESP.getFreePsram());
     t = millis();
-    while (millis() - t < 5000) { lv_task_handler(); delay(5); }
+    while (millis() - t < 5000) { bootLvglHandler(); delay(5); }
 
     // ── Sang boot screen ──────────────────────────────────────
     lv_scr_load_anim(boot_scr, LV_SCR_LOAD_ANIM_FADE_IN, 500, 0, false);
     t = millis();
-    while (millis() - t < 600) { lv_timer_handler(); delay(5); }
+    while (millis() - t < 600) { bootLvglHandler(); delay(5); }
     lv_obj_del(logo_scr);
     lv_obj_del(scr_x);
 
@@ -215,52 +315,37 @@ void showBootSequence() {
     snprintf(buf, sizeof(buf), "%.2f V", analogReadMilliVolts(BAT_ADC_PIN) * 2.0 / 1000.0);
     bootLine("OK", "Batt", buf, 56);
 
-    // 8. WiFi — đã được begin() từ main.cpp, ở đây chỉ chờ trạng thái thật
+    bootLine("OK", "System", "READY", 100);
+     // 8. WiFi — đã được begin() từ main.cpp, ở đây chỉ chờ trạng thái thật
     //    (7.6s logo ở trên thường đủ để nó kết nối xong)
     t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 8000) {
-        lv_timer_handler();
+    while (!isRescueModeActive() &&
+           WiFi.status() != WL_CONNECTED &&
+           millis() - t < 8000) {
+        bootLvglHandler();
         delay(50);
     }
-    if (WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED && !isRescueModeActive()) {
         bootLine("OK", "WiFi", WiFi.localIP().toString().c_str(), 66);
         snprintf(buf, sizeof(buf), "%ddBm  ch%d", WiFi.RSSI(), WiFi.channel());
         bootLine("OK", "Signal", buf, 74);
     } else {
         bootLine("FAIL", "WiFi", "timeout (retry bg)", 74);
     }
-
-    // 9. Telemetry — gọi lại chính fetchTruckData() của wifi_task.cpp
-    bool got = false;
-    if (WiFi.status() == WL_CONNECTED) {
-        for (int i = 0; i < 3 && !got; i++) {
-            fetchTruckData();
-            if (truck.make.length() > 0) got = true;
-            else { uint32_t w = millis(); while (millis() - w < 300) { lv_timer_handler(); delay(5); } }
-        }
-    }
-    if (got) {
-        snprintf(buf, sizeof(buf), "%s %s", truck.make.c_str(), truck.model.c_str());
-        bootLine("OK", "Truck", buf, 90);
-        bootLine("OK", "Plate", truck.licensePlate.length() ? truck.licensePlate.c_str() : "---", 96);
-    } else {
-        bootLine("WARN", "Telem", "no data (game off?)", 90);
-    }
-
-    bootLine("OK", "System", "READY", 100);
-
     lv_label_set_text(boot_status, LV_SYMBOL_OK " System Ready");
     t = millis();
-    while (millis() - t < 3800) { lv_timer_handler(); delay(5); }
+    while (millis() - t < 2500) { bootLvglHandler(); delay(5); }
 
     // ── Sang màn hình chính ───────────────────────────────────
     lv_scr_load_anim(main_scr, LV_SCR_LOAD_ANIM_FADE_IN, 500, 0, false);
     t = millis();
-    while (millis() - t < 600) { lv_timer_handler(); delay(5); }
+    while (millis() - t < 600) { bootLvglHandler(); delay(5); }
 
     lv_obj_del(boot_scr);
     boot_scr = nullptr;
     boot_log = nullptr;
+    boot_rescue_indicator = nullptr;
+    stopRescueButtonMonitor();
     Serial.println("[BOOT] Boot sequence completed");
 }
 
@@ -305,10 +390,24 @@ void lvgl_create_buffers()
 static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
     uint32_t w = area->x2 - area->x1 + 1;
     uint32_t h = area->y2 - area->y1 + 1;
+    const uint32_t flushStartedUs = micros();
     tft.startWrite();
     tft.setAddrWindow(area->x1, area->y1, w, h);
     tft.pushColors((uint16_t*)color_p, w * h, true);
     tft.endWrite();
+    const uint32_t flushElapsedUs = micros() - flushStartedUs;
+    cycleFlushUs += flushElapsedUs;
+    cycleFlushCount++;
+
+    if (displayTimingActive && !in_idle && cycleTelemetrySnapshotValid) {
+        if (cycleTelemetryGeneration != 0 &&
+            (!hasLatencyGeneration || cycleTelemetryGeneration != lastLatencyGeneration)) {
+            recordDisplayTiming(telemetryToFlushTiming, micros() - cycleTelemetryUpdatedAtUs);
+            lastLatencyGeneration = cycleTelemetryGeneration;
+            hasLatencyGeneration = true;
+        }
+    }
+
     lv_disp_flush_ready(drv);
 }
 
@@ -321,6 +420,8 @@ static lv_obj_t *lbl_truck_name;   // "MAN TGX"
 static lv_obj_t *lbl_plate;        // "77C-05669"
 static lv_obj_t *lbl_gear;         // "4"
 static lv_obj_t *lbl_clock;        // "10:13"
+static lv_obj_t *icon_blinker_left;
+static lv_obj_t *icon_blinker_right;
 
 // Row 2: nhiệt độ + speed
 static lv_obj_t *lbl_oil;          // "Oil:75C"
@@ -334,8 +435,10 @@ static lv_obj_t *lbl_dist;
 // Row 4: bars
 static lv_obj_t *bar_fuel;
 static lv_obj_t *lbl_fuel_val;
+static lv_obj_t *icon_highbeam;
 static lv_obj_t *bar_air;
 static lv_obj_t *lbl_air_val;
+static lv_obj_t *icon_lowbeam;
 
 // Row 5: wear
 static lv_obj_t *lbl_dam;          // "Dam Info" label
@@ -491,8 +594,11 @@ static void speed_arc_set_warn(bool warn) {
 static lv_obj_t   *ui_scr     = nullptr;   // màn hình dashboard chính
 static lv_obj_t   *idle_scr   = nullptr;   // màn hình ảnh chờ
 static lv_obj_t   *idle_img   = nullptr;
+static lv_obj_t   *idle_status_time = nullptr;
+static lv_obj_t   *idle_status_voltage = nullptr;
 static lv_timer_t *idle_timer = nullptr;
-static bool        in_idle    = false;
+static lv_obj_t   *rescue_ui_indicator = nullptr;
+static lv_obj_t   *rescue_idle_indicator = nullptr;
 
 static const lv_img_dsc_t* idle_imgs[] = {
     &q_res, &ribi1, &ribi2, &ribi3, &IMG_1388_resized_320x240
@@ -500,6 +606,50 @@ static const lv_img_dsc_t* idle_imgs[] = {
 };
 static const int IDLE_IMG_COUNT = sizeof(idle_imgs) / sizeof(idle_imgs[0]);
 static int idle_idx = 0;
+
+static String idleClockText() {
+    if (!game.connected || game.realTime.isEmpty()) {
+        char currentDateTime[32];
+        if (!getCurrentLocalDateTime(currentDateTime, sizeof(currentDateTime))) {
+            return "--:--";
+        }
+        return String(currentDateTime).substring(11, 16);
+    }
+
+    int timeStart = game.realTime.indexOf('T');
+    if (timeStart >= 0) {
+        timeStart++;
+    } else if (game.realTime.length() >= 16 && game.realTime.charAt(10) == ' ') {
+        timeStart = 11;
+    } else {
+        timeStart = 0;
+    }
+
+    if (game.realTime.length() >= timeStart + 5) {
+        return game.realTime.substring(timeStart, timeStart + 5);
+    }
+    return "--:--";
+}
+
+static void updateIdleStatus() {
+    static unsigned long lastUpdate = 0;
+    static String previousTime;
+
+    const unsigned long now = millis();
+    if (now - lastUpdate < 1000) return;
+    lastUpdate = now;
+
+    const String clock = idleClockText();
+    if (clock != previousTime) {
+        previousTime = clock;
+        lv_label_set_text(idle_status_time, clock.c_str());
+    }
+
+    const float batteryVoltage = analogReadMilliVolts(BAT_ADC_PIN) * 2.0f / 1000.0f;
+    char voltage[12];
+    snprintf(voltage, sizeof(voltage), "%.2fV", batteryVoltage);
+    lv_label_set_text(idle_status_voltage, voltage);
+}
 
 static void idle_slide_cb(lv_timer_t *) {
     idle_idx = (idle_idx + 1) % IDLE_IMG_COUNT;
@@ -517,8 +667,80 @@ static void createIdleScreen() {
     lv_img_set_src(idle_img, idle_imgs[0]);
     lv_obj_center(idle_img);
 
+    lv_obj_t *status_bar = lv_obj_create(idle_scr);
+    lv_obj_set_size(status_bar, 240, 22);
+    lv_obj_set_pos(status_bar, 0, 0);
+    lv_obj_set_style_bg_opa(status_bar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status_bar, 0, 0);
+    lv_obj_set_style_pad_all(status_bar, 0, 0);
+    lv_obj_clear_flag(status_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+
+    idle_status_time = lv_label_create(status_bar);
+    lv_obj_set_style_text_font(idle_status_time, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(idle_status_time, lv_color_hex(0x8CFF9B), 0);
+    lv_obj_align(idle_status_time, LV_ALIGN_LEFT_MID, 5, 0);
+    lv_label_set_text(idle_status_time, "--:--");
+
+    lv_obj_t *battery_icon = lv_obj_create(status_bar);
+    lv_obj_set_size(battery_icon, 13, 8);
+    lv_obj_align(battery_icon, LV_ALIGN_RIGHT_MID, -51, 0);
+    lv_obj_set_style_bg_opa(battery_icon, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(battery_icon, lv_color_hex(0x8CFF9B), 0);
+    lv_obj_set_style_border_width(battery_icon, 1, 0);
+    lv_obj_set_style_radius(battery_icon, 1, 0);
+    lv_obj_set_style_pad_all(battery_icon, 0, 0);
+    lv_obj_clear_flag(battery_icon, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *battery_terminal = lv_obj_create(status_bar);
+    lv_obj_set_size(battery_terminal, 2, 4);
+    lv_obj_align_to(battery_terminal, battery_icon, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(battery_terminal, lv_color_hex(0x8CFF9B), 0);
+    lv_obj_set_style_bg_opa(battery_terminal, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(battery_terminal, 0, 0);
+    lv_obj_set_style_pad_all(battery_terminal, 0, 0);
+    lv_obj_clear_flag(battery_terminal, LV_OBJ_FLAG_SCROLLABLE);
+
+    idle_status_voltage = lv_label_create(status_bar);
+    lv_obj_set_style_text_font(idle_status_voltage, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(idle_status_voltage, lv_color_hex(0x8CFF9B), 0);
+    lv_obj_align(idle_status_voltage, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_label_set_text(idle_status_voltage, "--.--V");
+
     idle_timer = lv_timer_create(idle_slide_cb, IDLE_SLIDE_MS, NULL);
     lv_timer_pause(idle_timer);          // chỉ chạy khi đang ở màn chờ
+}
+
+static lv_obj_t *createRescueIndicator(lv_obj_t *screen) {
+    lv_obj_t *indicator = lv_label_create(screen);
+    lv_obj_set_width(indicator, 240);
+    lv_obj_align(indicator, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_text_font(indicator, &roboto, 0);
+    lv_obj_set_style_text_color(indicator, lv_color_white(), 0);
+    lv_obj_set_style_text_align(indicator, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_color(indicator, lv_color_hex(0xD00000), 0);
+    lv_obj_set_style_bg_opa(indicator, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_top(indicator, 2, 0);
+    lv_obj_set_style_pad_bottom(indicator, 2, 0);
+    lv_label_set_text(indicator, "RESCUE AP ACTIVE - 192.168.4.1");
+    lv_obj_add_flag(indicator, LV_OBJ_FLAG_HIDDEN);
+    return indicator;
+}
+
+static void updateRescueIndicators() {
+    const bool active = isRescueModeActive();
+    if (!rescue_ui_indicator || !rescue_idle_indicator) return;
+    static bool previousActive = false;
+    if (active == previousActive) return;
+    previousActive = active;
+
+    if (active) {
+        lv_obj_clear_flag(rescue_ui_indicator, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(rescue_idle_indicator, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(rescue_ui_indicator, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(rescue_idle_indicator, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // Gọi trong DisplayTask, BÊN TRONG mutex (đọc game.*)
@@ -590,6 +812,16 @@ static void createUI() {
     lv_obj_align(lbl_gear, LV_ALIGN_CENTER, 0, 0);
     lv_label_set_text(lbl_gear, "N");
 
+    icon_blinker_left = lv_img_create(scr);
+    lv_img_set_src(icon_blinker_left, &left);
+    lv_obj_add_flag(icon_blinker_left, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(icon_blinker_left, 8, 41);
+
+    icon_blinker_right = lv_img_create(scr);
+    lv_img_set_src(icon_blinker_right, &right);
+    lv_obj_add_flag(icon_blinker_right, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(icon_blinker_right, 205, 41);
+
     lbl_clock = lv_label_create(hdr);
     lv_obj_set_style_text_font(lbl_clock, &roboto, 0);
     lv_obj_set_style_text_color(lbl_clock, lv_color_hex(0xFFD700), 0);
@@ -604,17 +836,17 @@ static void createUI() {
     // ── Divider xanh y=38 ─────────────────────────────────────
     make_divider(scr, 38, lv_color_hex(0x3A6EA5));
 
-    // ── Row2: Temp + Speed  y=40..99 ──────────────────────────
+    // ── Row2: Speed  y=40..99 ─────────────────────────────────
     lbl_oil = lv_label_create(scr);
     lv_obj_set_style_text_font(lbl_oil,  &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl_oil, lv_color_hex(0xFF9900), 0);
-    lv_obj_set_pos(lbl_oil, 4, 41);
+    lv_obj_set_pos(lbl_oil, 4, 108);
     lv_label_set_text(lbl_oil, "Oil:--C");
 
     lbl_h2o = lv_label_create(scr);
     lv_obj_set_style_text_font(lbl_h2o,  &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl_h2o, lv_color_hex(0x00AAFF), 0);
-    lv_obj_set_pos(lbl_h2o, 4, 57);
+    lv_obj_align(lbl_h2o, LV_ALIGN_TOP_RIGHT, -4, 108);
     lv_label_set_text(lbl_h2o, "H2O:--C");
 
     lbl_speed = lv_label_create(scr);
@@ -627,7 +859,7 @@ static void createUI() {
     // ── Speed arc: nửa vòng tròn bao quanh lbl_speed ──────────
     arc_speed = lv_arc_create(scr);
     lv_obj_set_size(arc_speed, SPD_ARC_R * 2, SPD_ARC_R * 2);
-    lv_obj_set_pos(arc_speed, SPD_ARC_CX - SPD_ARC_R, SPD_ARC_CY - SPD_ARC_R);
+    lv_obj_set_pos(arc_speed, SPD_ARC_CX - SPD_ARC_R, SPD_ARC_CY - SPD_ARC_R + 2 );
     lv_obj_remove_style(arc_speed, NULL, LV_PART_KNOB);          // bỏ núm tròn
     lv_obj_clear_flag(arc_speed, LV_OBJ_FLAG_CLICKABLE);         // chỉ để hiển thị
     lv_obj_set_style_bg_opa(arc_speed, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -660,7 +892,7 @@ static void createUI() {
     lbl_odo = lv_label_create(scr);
     lv_obj_set_style_text_font(lbl_odo, &fontodo, 0);
     lv_obj_set_style_text_color(lbl_odo, lv_color_hex(0xFFD700), 0);
-    lv_obj_align(lbl_odo, LV_ALIGN_TOP_MID, 0, 100 + SPD_DY);
+    lv_obj_align(lbl_odo, LV_ALIGN_TOP_MID, 0, 95 + SPD_DY);
     lv_label_set_text(lbl_odo, "ODO:0km");
 
     lbl_dist = lv_label_create(scr);
@@ -670,12 +902,17 @@ static void createUI() {
     lv_label_set_text(lbl_dist, "0km");
 
     // ── Row4: Fuel bar + Air bar  y=114..132 ──────────────────
-    // Fuel label icon
     lv_obj_t *ic_fuel = lv_label_create(scr);
     lv_obj_set_style_text_font(ic_fuel, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ic_fuel, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_pos(ic_fuel, 2, 115 + SPD_DY);
     lv_label_set_text(ic_fuel, LV_SYMBOL_BATTERY_FULL);
+
+    lv_obj_t *ic_air = lv_label_create(scr);
+    lv_obj_set_style_text_font(ic_air, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ic_air, lv_color_hex(0xFFD700), 0);
+    lv_obj_set_pos(ic_air, 122, 115 + SPD_DY);
+    lv_label_set_text(ic_air, LV_SYMBOL_REFRESH);
 
     bar_fuel = lv_bar_create(scr);
     lv_obj_set_size(bar_fuel, 94, 14);
@@ -694,13 +931,6 @@ static void createUI() {
     lv_obj_set_style_text_color(lbl_fuel_val, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align_to(lbl_fuel_val, bar_fuel, LV_ALIGN_CENTER, 0, 0);
     lv_label_set_text(lbl_fuel_val, "0");
-
-    // Air label icon
-    lv_obj_t *ic_air = lv_label_create(scr);
-    lv_obj_set_style_text_font(ic_air, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ic_air, lv_color_hex(0xFFD700), 0);
-    lv_obj_set_pos(ic_air, 122, 115 + SPD_DY);
-    lv_label_set_text(ic_air, LV_SYMBOL_REFRESH);
 
     bar_air = lv_bar_create(scr);
     lv_obj_set_size(bar_air, 88, 14);
@@ -745,11 +975,51 @@ static void createUI() {
     lv_obj_align(lbl_wear_c, LV_ALIGN_TOP_RIGHT, -30, 150 + SPD_DY);
     lv_label_set_text(lbl_wear_c, "C:0%");
 
-    icon_park = lv_img_create(scr);
+
+    static lv_obj_t *icon_row;
+
+// ... trong createUI(), thay cho 3 đoạn tạo icon cũ:
+icon_row = lv_obj_create(scr);
+lv_obj_remove_style_all(icon_row);
+lv_obj_set_size(icon_row, 160, 30);
+lv_obj_set_pos(icon_row, 240 - 160, 200);          // mép phải container = mép phải màn hình
+lv_obj_clear_flag(icon_row, LV_OBJ_FLAG_SCROLLABLE);
+
+lv_obj_set_flex_flow(icon_row, LV_FLEX_FLOW_ROW);
+lv_obj_set_flex_align(icon_row,
+    LV_FLEX_ALIGN_END,      // main axis: dồn về cạnh PHẢI
+    LV_FLEX_ALIGN_CENTER,   // cross axis
+    LV_FLEX_ALIGN_CENTER);
+lv_obj_set_style_pad_column(icon_row, 2, 0);
+
+// Thứ tự tạo = từ trái sang phải
+icon_highbeam = lv_img_create(icon_row);
+lv_img_set_src(icon_highbeam, &_40x30_hightbeam);
+lv_obj_add_flag(icon_highbeam, LV_OBJ_FLAG_HIDDEN);
+
+icon_lowbeam = lv_img_create(icon_row);
+lv_img_set_src(icon_lowbeam, &_40x30_lowbeam);
+lv_obj_add_flag(icon_lowbeam, LV_OBJ_FLAG_HIDDEN);
+
+icon_park = lv_img_create(icon_row);
+lv_img_set_src(icon_park, &park);
+    //code  cũ
+   /*  icon_park = lv_img_create(scr);
     lv_obj_set_pos(icon_park, 200, 200); 
     lv_img_set_src(icon_park, &park);
-    
- 
+ //// code
+    icon_lowbeam = lv_img_create(scr);
+    lv_img_set_src(icon_lowbeam, &_40x30_lowbeam);
+ //   lv_img_set_zoom(icon_lowbeam, 128);
+    lv_obj_set_pos(icon_lowbeam, 158, 200);
+    lv_obj_add_flag(icon_lowbeam, LV_OBJ_FLAG_HIDDEN);
+
+    icon_highbeam = lv_img_create(scr);
+    lv_img_set_src(icon_highbeam, &_40x30_hightbeam);
+   // lv_img_set_zoom(icon_highbeam, 128);
+    lv_obj_set_pos(icon_highbeam, 116, 200);
+    lv_obj_add_flag(icon_highbeam, LV_OBJ_FLAG_HIDDEN);
+  */
 
     // ── Divider đỏ y=212 ──────────────────────────────────────
     make_divider(scr, 280, lv_color_hex(0xCC2200));
@@ -810,7 +1080,14 @@ static void refreshUI() {
 
     // ── Clock ─────────────────────────────────────────────────
     static String prev_clock;
-    String cur_clock = game.realTime.length() > 0 ? game.realTime : String(timeStr);
+    String cur_clock;
+    if (game.connected && game.realTime.length() > 0) {
+        cur_clock = game.realTime;
+    } else {
+        char currentDateTime[32];
+        cur_clock = getCurrentLocalDateTime(currentDateTime, sizeof(currentDateTime))
+            ? String(currentDateTime) : String(timeStr);
+    }
     if (cur_clock != prev_clock) {
         prev_clock = cur_clock;
         lv_label_set_text(lbl_clock, cur_clock.c_str());
@@ -856,6 +1133,46 @@ static void refreshUI() {
         speed_arc_set_warn(speed_warn);
         lv_obj_set_style_text_color(lbl_speed,
             speed_warn ? lv_color_hex(0xFF4444) : lv_color_hex(0xFFFFFF), 0);
+    }
+
+    static bool prev_blinker_left = false;
+    if (truck.blinkerLeftOn != prev_blinker_left) {
+        prev_blinker_left = truck.blinkerLeftOn;
+        if (truck.blinkerLeftOn) {
+            lv_obj_clear_flag(icon_blinker_left, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(icon_blinker_left, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    static bool prev_blinker_right = false;
+    if (truck.blinkerRightOn != prev_blinker_right) {
+        prev_blinker_right = truck.blinkerRightOn;
+        if (truck.blinkerRightOn) {
+            lv_obj_clear_flag(icon_blinker_right, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(icon_blinker_right, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    static bool prev_highbeam = false;
+    if (truck.lightsBeamHighOn != prev_highbeam) {
+        prev_highbeam = truck.lightsBeamHighOn;
+        if (truck.lightsBeamHighOn) {
+            lv_obj_clear_flag(icon_highbeam, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(icon_highbeam, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    static bool prev_lowbeam = false;
+    if (truck.lightsBeamLowOn != prev_lowbeam) {
+        prev_lowbeam = truck.lightsBeamLowOn;
+        if (truck.lightsBeamLowOn) {
+            lv_obj_clear_flag(icon_lowbeam, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(icon_lowbeam, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     // ── RPM bar (mượt) ────────────────────────────────────────
@@ -1168,6 +1485,8 @@ void setupDisplay() {
     // ── Tạo UI ────────────────────────────────────────────────
     createUI();
     createIdleScreen();
+    rescue_ui_indicator = createRescueIndicator(ui_scr);
+    rescue_idle_indicator = createRescueIndicator(idle_scr);
 
     Serial.println("[TFT] Display + Boot sequence OK");
 }
@@ -1258,14 +1577,19 @@ static void updateOtaScreen() {
 void DisplayTask(void* parameter) {
     Serial.println("[DisplayTask] Started on core " + String(xPortGetCoreID()));
     Serial.println("[DisplayTask] Free heap: " + String(ESP.getFreeHeap()));
+    displayTimingActive = true;
+    bool startupMelodyPending =
+        esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER;
 
     for (;;) {
         unsigned long now = millis();
+        updateRescueIndicators();
 
         if (now - lastTFTUpdate >= TFT_UPDATE_INTERVAL) {
             lastTFTUpdate = now;
 
             if (otaState != 0) {             // đang nạp firmware qua WiFi → chỉ vẽ màn OTA
+                cycleTelemetrySnapshotValid = false;
                 updateOtaScreen();
                 lv_timer_handler();
                 vTaskDelay(pdMS_TO_TICKS(5));
@@ -1273,14 +1597,34 @@ void DisplayTask(void* parameter) {
             }
 
             // Đọc data có mutex
+            cycleTelemetrySnapshotValid = false;
             if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 updateScreenMode();          // chọn dashboard / ảnh chờ
-                if (!in_idle) refreshUI();   // đang hiện ảnh thì khỏi cập nhật widget
+                if (!in_idle) {
+                    const uint32_t uiStartedUs = micros();
+                    refreshUI();              // đang hiện ảnh thì khỏi cập nhật widget
+                    recordDisplayTiming(uiTiming, micros() - uiStartedUs);
+                    getTelemetryTimingSnapshot(&cycleTelemetryUpdatedAtUs,
+                                               &cycleTelemetryGeneration);
+                    cycleTelemetrySnapshotValid = true;
+                }
+                else updateIdleStatus();
                 xSemaphoreGive(dataAccessMutex);
             }
 
             // lv_task_handler() NGOÀI mutex — flush SPI không cần mutex
+            cycleFlushUs = 0;
+            cycleFlushCount = 0;
+            const uint32_t lvglStartedUs = micros();
             lv_timer_handler();
+            recordDisplayTiming(lvglTiming, micros() - lvglStartedUs);
+            if (cycleFlushCount > 0) recordDisplayTiming(flushTiming, cycleFlushUs);
+            if (startupMelodyPending && cycleFlushCount > 0) {
+                startupMelodyPending = false;
+                playStartupCompletionMelody();
+            }
+
+            if (++displayTimingCycles >= 500) reportDisplayTimingWindow();
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
