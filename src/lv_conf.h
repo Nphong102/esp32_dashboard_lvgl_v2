@@ -81,8 +81,11 @@
 #define LV_USE_GPU_SDL          0
 
 // ── Performance monitor (tắt production) ───────────────────
-#define LV_USE_PERF_MONITOR     0
-#define LV_USE_MEM_MONITOR      0
+#define LV_USE_PERF_MONITOR     1
+#define LV_USE_MEM_MONITOR      1
+#if LV_USE_PERF_MONITOR
+    #define LV_USE_PERF_MONITOR_POS LV_ALIGN_BOTTOM_RIGHT
+#endif
 
 // ── Misc ────────────────────────────────────────────────────
 #define LV_USE_USER_DATA        1

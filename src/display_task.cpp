@@ -1,6 +1,6 @@
 /**
  * display_task.cpp
- * - Init TFT_eSPI + LVGL
+ * - Init LovyanGFX + LVGL
  * - Tạo toàn bộ widget UI (giống layout ảnh chụp)
  * - Cập nhật widget từ truck/game/job/trailer data
  * - Chạy trong DisplayTask trên core 1
@@ -12,6 +12,7 @@
 #define SCREEN_WIDTH    320     // ← Thay bằng độ phân giải thực của màn hình bạn
 #define SCREEN_HEIGHT   240     // ← Thay bằng độ phân giải thực của màn hình bạn
 #include "config.h"
+#include "battery_monitor.h"
 #include "data_types.h"
 #include "display_task.h"
 #include "wifi_task.h"
@@ -20,20 +21,24 @@
 #include "font/myfont.h"
 #include <esp_ota_ops.h>
 #include <esp_sleep.h>
+#include <driver/gpio.h>
+#include <string.h>
 LV_IMG_DECLARE(q_res);  
-LV_IMG_DECLARE(x);
-LV_IMG_DECLARE(x_1);
-LV_IMG_DECLARE(x_2);
+LV_IMG_DECLARE(IMG_2220Res);
+LV_IMG_DECLARE(qq);
+/* LV_IMG_DECLARE(x_2);
 LV_IMG_DECLARE(x_3);
 LV_IMG_DECLARE(x_4);
-LV_IMG_DECLARE(x_5);
+LV_IMG_DECLARE(x_5); */
 LV_IMG_DECLARE(ribi1); 
-LV_IMG_DECLARE(IMG_1388_resized_320x240); 
+LV_IMG_DECLARE(combine); 
 LV_IMG_DECLARE(ribi2);
 LV_IMG_DECLARE(ribi3); 
 LV_IMG_DECLARE(park); 
 LV_IMG_DECLARE(left);
 LV_IMG_DECLARE(right);
+LV_IMG_DECLARE(fuel);
+LV_IMG_DECLARE(air);
 LV_IMG_DECLARE(_40x30_hightbeam);
 LV_IMG_DECLARE(_40x30_lowbeam);
  /* forward-declare the symbol */
@@ -45,8 +50,10 @@ LV_IMG_DECLARE(_40x30_lowbeam);
 // ════════════════════════════════════════════════════════
 // 1. LVGL DRIVER — buffer từ PSRAM
 // ════════════════════════════════════════════════════════
-#define BUF_LINES  20                        // 20 dòng × 240px × 2byte = 9,600B
-#define BUF_SIZE   (240 * BUF_LINES)
+#define LVGL_HOR_RES 240
+#define LVGL_VER_RES 320
+#define LVGL_DRAW_BUFFER_LINES 40
+#define LVGL_DRAW_BUFFER_SIZE (LVGL_HOR_RES * LVGL_DRAW_BUFFER_LINES)
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t      disp_drv;
@@ -170,7 +177,7 @@ void showBootSequence() {
 
     // ── Màn hình boot ─────────────────────────────────────────
     boot_scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(boot_scr, lv_color_hex(0x000010), 0);
+    lv_obj_set_style_bg_color(boot_scr, lv_color_hex(0X000033), 0);
     lv_obj_set_style_bg_opa(boot_scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(boot_scr, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -240,7 +247,7 @@ void showBootSequence() {
     lv_obj_t *logo_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(logo_scr, lv_color_black(), 0);
     lv_obj_t *logo_img = lv_img_create(logo_scr);
-    lv_img_set_src(logo_img, &q_res);
+    lv_img_set_src(logo_img, &IMG_2220Res);
     lv_obj_center(logo_img);
     lv_scr_load_anim(logo_scr, LV_SCR_LOAD_ANIM_FADE_IN, 500, 0, false);
     Serial.printf("anh 1 load  psram=%d\n", ESP.getFreePsram());
@@ -251,7 +258,7 @@ void showBootSequence() {
     lv_obj_t *scr_x = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_x, lv_color_black(), 0);
     lv_obj_t *img_x = lv_img_create(scr_x);
-    lv_img_set_src(img_x, &IMG_1388_resized_320x240);
+    lv_img_set_src(img_x, &combine);
     lv_obj_center(img_x);
     lv_scr_load_anim(scr_x, LV_SCR_LOAD_ANIM_OVER_RIGHT, 500, 0, false);
     Serial.printf("anh 2  load  psram=%d\n", ESP.getFreePsram());
@@ -312,8 +319,13 @@ void showBootSequence() {
     bootLine("OK", "LVGL", buf, 48);
 
     // 7. Pin
-    snprintf(buf, sizeof(buf), "%.2f V", analogReadMilliVolts(BAT_ADC_PIN) * 2.0 / 1000.0);
-    bootLine("OK", "Batt", buf, 56);
+    BatteryReading batteryReading;
+    if (readBatteryMonitor(batteryReading)) {
+        snprintf(buf, sizeof(buf), "%.2f V", batteryReading.voltageV);
+        bootLine("OK", "Batt", buf, 56);
+    } else {
+        bootLine("FAIL", "Batt", "measurement unavailable", 56);
+    }
 
     bootLine("OK", "System", "READY", 100);
      // 8. WiFi — đã được begin() từ main.cpp, ở đây chỉ chờ trạng thái thật
@@ -349,66 +361,78 @@ void showBootSequence() {
     Serial.println("[BOOT] Boot sequence completed");
 }
 
-void lvgl_create_buffers() 
-{
-    // Chọn kích thước buffer (càng lớn càng mượt, nhưng tốn PSRAM)
-    // BUF_SIZE = SCREEN_WIDTH * SCREEN_HEIGHT / N
-    const uint32_t buf_size = (SCREEN_WIDTH * SCREEN_HEIGHT) ;   // ← Dùng 1/4 màn hình (khuyến nghị)
 
-    Serial.printf("[LVGL] Allocating buffers: %d pixels each (~%d KB)\n", 
-                  buf_size, (buf_size * sizeof(lv_color_t)) / 1024);
+static volatile uint32_t frameCount = 0, flushCount = 0;
+static volatile uint32_t flushUs = 0, waitUs = 0;
 
-    // Cấp phát từ PSRAM
-    lvgl_buf1 = (lv_color_t*)heap_caps_malloc(buf_size * sizeof(lv_color_t), 
-                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    
-    lvgl_buf2 = (lv_color_t*)heap_caps_malloc(buf_size * sizeof(lv_color_t), 
-                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+static void reportDisplayPerformance(uint32_t now) {
+    static uint32_t lastPrintMs = 0;
+    static uint32_t lastFrames = 0;
+    static uint32_t lastFlushes = 0;
+    static uint32_t lastFlushUs = 0;
+    static uint32_t lastWaitUs = 0;
 
-    if (lvgl_buf1 == nullptr || lvgl_buf2 == nullptr) 
-    {
-        Serial.println("[LVGL] PSRAM alloc failed! Using smaller buffer.");
-
-        // Fallback: dùng buffer nhỏ hơn trong Internal RAM
-        if (lvgl_buf1) heap_caps_free(lvgl_buf1);
-        if (lvgl_buf2) heap_caps_free(lvgl_buf2);
-
-        lvgl_buf1 = (lv_color_t*)heap_caps_malloc(SCREEN_WIDTH * 40 * sizeof(lv_color_t), MALLOC_CAP_INTERNAL);
-        lvgl_buf2 = nullptr;
-
-        lv_disp_draw_buf_init(&draw_buf, lvgl_buf1, lvgl_buf2, SCREEN_WIDTH * 40);
-        Serial.println("[LVGL] Fallback to small internal buffer");
-    } 
-    else 
-    {
-        lv_disp_draw_buf_init(&draw_buf, lvgl_buf1, lvgl_buf2, buf_size);
-        Serial.println("[LVGL] Double buffer in PSRAM → OK (Good performance)");
-    }
+    if (lastPrintMs == 0) {
+        lastPrintMs = now;
+        return;
     }
 
-// flush callback — LVGL → TFT_eSPI
-static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
-    uint32_t w = area->x2 - area->x1 + 1;
-    uint32_t h = area->y2 - area->y1 + 1;
-    const uint32_t flushStartedUs = micros();
-    tft.startWrite();
-    tft.setAddrWindow(area->x1, area->y1, w, h);
-    tft.pushColors((uint16_t*)color_p, w * h, true);
-    tft.endWrite();
-    const uint32_t flushElapsedUs = micros() - flushStartedUs;
-    cycleFlushUs += flushElapsedUs;
-    cycleFlushCount++;
+    const uint32_t elapsedMs = now - lastPrintMs;
+    if (elapsedMs < 1000) return;
 
-    if (displayTimingActive && !in_idle && cycleTelemetrySnapshotValid) {
-        if (cycleTelemetryGeneration != 0 &&
-            (!hasLatencyGeneration || cycleTelemetryGeneration != lastLatencyGeneration)) {
-            recordDisplayTiming(telemetryToFlushTiming, micros() - cycleTelemetryUpdatedAtUs);
-            lastLatencyGeneration = cycleTelemetryGeneration;
-            hasLatencyGeneration = true;
-        }
-    }
+    const uint32_t frames = frameCount;
+    const uint32_t flushes = flushCount;
+    const uint32_t totalFlushUs = flushUs;
+    const uint32_t totalWaitUs = waitUs;
+    const uint32_t frameDelta = frames - lastFrames;
+    const uint32_t flushDelta = flushes - lastFlushes;
+    const uint32_t flushUsDelta = totalFlushUs - lastFlushUs;
+    const uint32_t waitUsDelta = totalWaitUs - lastWaitUs;
 
+    Serial.printf("[PERF] FPS=%u flush/s=%u avgFlush=%u us avgWaitDMA=%u us\n",
+                  (unsigned)(frameDelta * 1000U / elapsedMs),
+                  (unsigned)(flushDelta * 1000U / elapsedMs),
+                  flushDelta ? (unsigned)(flushUsDelta / flushDelta) : 0,
+                  flushDelta ? (unsigned)(waitUsDelta / flushDelta) : 0);
+
+    lastPrintMs = now;
+    lastFrames = frames;
+    lastFlushes = flushes;
+    lastFlushUs = totalFlushUs;
+    lastWaitUs = totalWaitUs;
+}
+
+
+static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *a, lv_color_t *c) {
+    const uint32_t w = a->x2 - a->x1 + 1;
+    const uint32_t h = a->y2 - a->y1 + 1;
+
+    const uint32_t t0 = micros();
+    tft.waitDMA();                       // chờ lần DMA trước
+    const uint32_t t1 = micros();
+    if (tft.getStartCount() == 0) tft.startWrite();
+    tft.pushImageDMA(a->x1, a->y1, w, h,
+                     reinterpret_cast<const lgfx::rgb565_t *>(&c->full));
+    const uint32_t t2 = micros();
+
+    waitUs  += (t1 - t0);                // lớn => DMA trước chưa xong kịp (SPI là nút thắt)
+    flushUs += (t2 - t0);
+    flushCount++;
+    if (lv_disp_flush_is_last(drv)) frameCount++;
     lv_disp_flush_ready(drv);
+}
+
+static void lvgl_create_buffers() {
+    const uint32_t px = LVGL_DRAW_BUFFER_SIZE;
+    lvgl_buf1 = (lv_color_t *)heap_caps_malloc(px * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    lvgl_buf2 = (lv_color_t *)heap_caps_malloc(px * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    Serial.printf("[LVGL] buf1=%p buf2=%p (%u KB mỗi cái)\n", lvgl_buf1, lvgl_buf2,
+                  (unsigned)(px * sizeof(lv_color_t) / 1024));
+    if (!lvgl_buf1 || !lvgl_buf2) {
+        Serial.println("[LVGL] Cấp phát buffer thất bại!");
+        while (true) delay(1000);
+    }
+    lv_disp_draw_buf_init(&draw_buf, lvgl_buf1, lvgl_buf2, px);
 }
 
 // ════════════════════════════════════════════════════════
@@ -454,7 +478,248 @@ static lv_obj_t *icon_park;
 static lv_obj_t *lbl_trl_prefix;
 static lv_obj_t *lbl_vol;
 static lv_obj_t  *spd_limit ;
+static lv_obj_t *limit_val ;
+static lv_obj_t *encoder_page_panel = nullptr;
+static lv_obj_t *encoder_page_title = nullptr;
+static lv_obj_t *engine_page_values[8] = {};
+static lv_obj_t *trip_page_values[6] = {};
 static const lv_img_dsc_t* speed_imgs[] = {&sp30, &sp40, &sp50, &sp60, &sp70, &sp80, &sp90};
+
+static constexpr int ENCODER_PAGE_COUNT = 3;
+static volatile int16_t encoderDetents = 0;
+static volatile int8_t encoderTransition = 0;
+static volatile uint8_t encoderPreviousState = 0;
+static portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t encoderPage = 0;
+static char configuredAccessPin[5] = "3258";
+static uint8_t enteredAccessPin[4] = {};
+static uint8_t selectedAccessDigit = 0;
+static bool accessGranted = false;
+static lv_obj_t *ui_scr = nullptr;
+static lv_obj_t *accessPinScreen = nullptr;
+static lv_obj_t *accessPinDigits[4] = {};
+static lv_obj_t *accessPinBoxes[4] = {};
+static lv_obj_t *accessPinMessage = nullptr;
+static int encoderButtonRaw = HIGH;
+static int encoderButtonStable = HIGH;
+static uint32_t encoderButtonChangedAt = 0;
+
+DRAM_ATTR static const int8_t encoderTransitionTable[16] = {
+     0, -1,  1,  0,
+     1,  0,  0, -1,
+    -1,  0,  0,  1,
+     0,  1, -1,  0
+};
+
+static void IRAM_ATTR encoder_isr() {
+    portENTER_CRITICAL_ISR(&encoderMux);
+    const uint8_t state =
+        (gpio_get_level((gpio_num_t)ENCODER_A_PIN) << 1) |
+         gpio_get_level((gpio_num_t)ENCODER_B_PIN);
+    const uint8_t transition = (encoderPreviousState << 2) | state;
+    const int8_t movement = encoderTransitionTable[transition];
+    encoderPreviousState = state;
+    if (movement != 0) {
+        encoderTransition += movement;
+        if (encoderTransition >= 4) {
+            encoderDetents++;
+            encoderTransition = 0;
+        } else if (encoderTransition <= -4) {
+            encoderDetents--;
+            encoderTransition = 0;
+        }
+    }
+    portEXIT_CRITICAL_ISR(&encoderMux);
+}
+
+static void setupRotaryEncoder() {
+    pinMode(ENCODER_A_PIN, INPUT_PULLUP);
+    pinMode(ENCODER_B_PIN, INPUT_PULLUP);
+    pinMode(ENCODER_SW_PIN, INPUT_PULLUP);
+    encoderPreviousState =
+        (digitalRead(ENCODER_A_PIN) << 1) | digitalRead(ENCODER_B_PIN);
+    encoderButtonRaw = digitalRead(ENCODER_SW_PIN);
+    encoderButtonStable = encoderButtonRaw;
+    encoderButtonChangedAt = millis();
+    attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), encoder_isr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_B_PIN), encoder_isr, CHANGE);
+    Serial.printf("[ENCODER] Ready: A=GPIO%d B=GPIO%d SW=GPIO%d\n",
+                  ENCODER_A_PIN, ENCODER_B_PIN, ENCODER_SW_PIN);
+}
+
+static void updateAccessPinDisplay() {
+    for (uint8_t i = 0; i < 4; i++) {
+        if (i < selectedAccessDigit) {
+            lv_label_set_text(accessPinDigits[i], "*");
+        } else if (i > selectedAccessDigit) {
+            lv_label_set_text(accessPinDigits[i], " ");
+        } else {
+            lv_label_set_text_fmt(accessPinDigits[i], "%u", enteredAccessPin[i]);
+        }
+        lv_obj_set_style_border_color(
+            accessPinBoxes[i],
+            i == selectedAccessDigit ? lv_color_hex(0x00DDFF) : lv_color_hex(0x34445F),
+            0);
+    }
+}
+
+static void createAccessPinScreen() {
+    accessPinScreen = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(accessPinScreen, lv_color_hex(0x000033), 0);
+    lv_obj_set_style_bg_opa(accessPinScreen, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(accessPinScreen, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(accessPinScreen);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x00DDFF), 0);
+    lv_label_set_text(title, "NHAP MA PIN");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 64);
+
+    lv_obj_t *hint = lv_label_create(accessPinScreen);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0xB0BEC5), 0);
+    lv_label_set_text(hint, "Xoay de chon so, nhan de xac nhan");
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 105);
+
+    for (uint8_t i = 0; i < 4; i++) {
+        lv_obj_t *box = lv_obj_create(accessPinScreen);
+        accessPinBoxes[i] = box;
+        lv_obj_set_size(box, 42, 54);
+        lv_obj_set_pos(box, 24 + i * 48, 150);
+        lv_obj_set_style_bg_color(box, lv_color_hex(0x091525), 0);
+        lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(box, 2, 0);
+        lv_obj_set_style_border_color(box, lv_color_hex(0x34445F), 0);
+        lv_obj_set_style_radius(box, 7, 0);
+        lv_obj_set_style_pad_all(box, 0, 0);
+        lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *digit = lv_label_create(box);
+        accessPinDigits[i] = digit;
+        lv_obj_set_style_text_font(digit, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(digit, lv_color_white(), 0);
+        lv_obj_center(digit);
+    }
+
+    accessPinMessage = lv_label_create(accessPinScreen);
+    lv_obj_set_style_text_font(accessPinMessage, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(accessPinMessage, lv_color_hex(0xFFD700), 0);
+    lv_label_set_text(accessPinMessage, " ");
+    lv_obj_align(accessPinMessage, LV_ALIGN_TOP_MID, 0, 226);
+    updateAccessPinDisplay();
+}
+
+static void adjustAccessPinDigit(int8_t direction) {
+    int value = (int)enteredAccessPin[selectedAccessDigit] + direction;
+    if (value < 0) value += 10;
+    if (value > 9) value -= 10;
+    enteredAccessPin[selectedAccessDigit] = (uint8_t)value;
+    updateAccessPinDisplay();
+}
+
+static void confirmAccessPinDigit() {
+    if (selectedAccessDigit < 3) {
+        selectedAccessDigit++;
+        lv_label_set_text(accessPinMessage, " ");
+        updateAccessPinDisplay();
+        return;
+    }
+
+    bool matches = true;
+    for (uint8_t i = 0; i < 4; i++) {
+        if (enteredAccessPin[i] != (uint8_t)(configuredAccessPin[i] - '0')) {
+            matches = false;
+            break;
+        }
+    }
+
+    if (matches) {
+        accessGranted = true;
+        if (ui_scr) lv_scr_load(ui_scr);
+        Serial.println("[AUTH] PIN accepted");
+        return;
+    }
+
+    lv_label_set_text(accessPinMessage, "SAI MA, THU LAI");
+    lv_obj_set_style_text_color(accessPinMessage, lv_color_hex(0xFF5555), 0);
+    memset(enteredAccessPin, 0, sizeof(enteredAccessPin));
+    selectedAccessDigit = 0;
+    updateAccessPinDisplay();
+}
+
+static void setLabelTextIfChanged(lv_obj_t *label, const char *text) {
+    const char *currentText = lv_label_get_text(label);
+    if (currentText == nullptr || strcmp(currentText, text) != 0) {
+        lv_label_set_text(label, text);
+    }
+}
+
+static void selectEncoderPage(int16_t direction) {
+    int page = (int)encoderPage + direction;
+    while (page < 0) page += ENCODER_PAGE_COUNT;
+    encoderPage = page % ENCODER_PAGE_COUNT;
+
+    if (encoderPage == 0) {
+        lv_obj_add_flag(encoder_page_panel, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(encoder_page_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(encoder_page_title,
+                          encoderPage == 1 ? "ENGINE  2/3" : "TRIP / TRAILER  3/3");
+        for (lv_obj_t *label : engine_page_values) {
+            if (encoderPage == 1) lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+        }
+        for (lv_obj_t *label : trip_page_values) {
+            if (encoderPage == 2) lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    Serial.printf("[UI] Encoder page %u/%u\n",
+                  (unsigned)(encoderPage + 1), ENCODER_PAGE_COUNT);
+}
+
+static void pollRotaryEncoder() {
+    const int buttonRaw = digitalRead(ENCODER_SW_PIN);
+    if (buttonRaw != encoderButtonRaw) {
+        encoderButtonRaw = buttonRaw;
+        encoderButtonChangedAt = millis();
+    }
+
+    bool buttonPressed = false;
+    if (millis() - encoderButtonChangedAt >= 30 &&
+        encoderButtonStable != encoderButtonRaw) {
+        encoderButtonStable = encoderButtonRaw;
+        buttonPressed = encoderButtonStable == LOW;
+    }
+
+    int16_t detents;
+    portENTER_CRITICAL(&encoderMux);
+    detents = encoderDetents;
+    encoderDetents = 0;
+    portEXIT_CRITICAL(&encoderMux);
+
+    if (!accessGranted) {
+        while (detents > 0) {
+            adjustAccessPinDigit(1);
+            detents--;
+        }
+        while (detents < 0) {
+            adjustAccessPinDigit(-1);
+            detents++;
+        }
+        if (buttonPressed) confirmAccessPinDigit();
+        return;
+    }
+
+    while (detents > 0) {
+        selectEncoderPage(1);
+        detents--;
+    }
+    while (detents < 0) {
+        selectEncoderPage(-1);
+        detents++;
+    }
+}
 
 // ════════════════════════════════════════════════════════
 // 3. HELPER: tạo horizontal divider
@@ -478,7 +743,7 @@ static void make_divider(lv_obj_t *parent, lv_coord_t y, lv_color_t color) {
 #define RPM_MAX_DEFAULT  2500   // dùng khi telemetry chưa có engineRpmMax
 #define RPM_WARN_PCT     85     // ≥ 85% thang đo: vàng cam
 #define RPM_RED_PCT      95     // ≥ 95% thang đo: đỏ
-#define RPM_ANIM_MS      220    // hơi lớn hơn chu kỳ fetch (200ms) → thanh không bao giờ đứng yên
+#define RPM_ANIM_MS      100    // hơi lớn hơn chu kỳ fetch (200ms) → thanh không bao giờ đứng yên
 
 static lv_obj_t *bar_rpm       = nullptr;
 static int       rpm_zone      = -1;
@@ -548,7 +813,7 @@ static void rpm_set_target(int rpm, int rpmMax) {
 #define SPD_ARC_W     8                     // độ dày cung
 #define SPD_ARC_CX    120                    // tâm ngang (giữa màn hình 240px)
 #define SPD_ARC_CY    (88 + SPD_DY)          // tâm dọc = đường đáy nửa vòng tròn
-#define SPD_ANIM_MS   220
+#define SPD_ANIM_MS   100
 
 static lv_obj_t *arc_speed    = nullptr;
 static int       spd_last_tgt = -1;
@@ -591,7 +856,6 @@ static void speed_arc_set_warn(bool warn) {
 #define IDLE_EXIT_DELAY_MS      300
 #define IDLE_SLIDE_MS           6000  // đổi ảnh mỗi 6s
 
-static lv_obj_t   *ui_scr     = nullptr;   // màn hình dashboard chính
 static lv_obj_t   *idle_scr   = nullptr;   // màn hình ảnh chờ
 static lv_obj_t   *idle_img   = nullptr;
 static lv_obj_t   *idle_status_time = nullptr;
@@ -601,7 +865,7 @@ static lv_obj_t   *rescue_ui_indicator = nullptr;
 static lv_obj_t   *rescue_idle_indicator = nullptr;
 
 static const lv_img_dsc_t* idle_imgs[] = {
-    &q_res, &ribi1, &ribi2, &ribi3, &IMG_1388_resized_320x240
+    &q_res, &ribi1, &ribi2, &ribi3, &combine, &IMG_2220Res, &qq
     
 };
 static const int IDLE_IMG_COUNT = sizeof(idle_imgs) / sizeof(idle_imgs[0]);
@@ -645,9 +909,13 @@ static void updateIdleStatus() {
         lv_label_set_text(idle_status_time, clock.c_str());
     }
 
-    const float batteryVoltage = analogReadMilliVolts(BAT_ADC_PIN) * 2.0f / 1000.0f;
     char voltage[12];
-    snprintf(voltage, sizeof(voltage), "%.2fV", batteryVoltage);
+    BatteryReading batteryReading;
+    if (readBatteryMonitor(batteryReading)) {
+        snprintf(voltage, sizeof(voltage), "%.2fV", batteryReading.voltageV);
+    } else {
+        snprintf(voltage, sizeof(voltage), "ERR");
+    }
     lv_label_set_text(idle_status_voltage, voltage);
 }
 
@@ -774,13 +1042,25 @@ static void updateScreenMode() {
     }
 }
 
+static lv_obj_t *createEncoderPageLabel(lv_obj_t *parent, lv_coord_t x,
+                                         lv_coord_t y, lv_coord_t width,
+                                         lv_color_t color) {
+    lv_obj_t *label = lv_label_create(parent);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_width(label, width);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, color, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    return label;
+}
+
 // ════════════════════════════════════════════════════════
 // 4. createUI — xây widget tree một lần duy nhất
 // ════════════════════════════════════════════════════════
 static void createUI() {
     lv_obj_t *scr = lv_scr_act();
     ui_scr = scr;
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000010), 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000033), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -788,7 +1068,7 @@ static void createUI() {
     lv_obj_t *hdr = lv_obj_create(scr);
     lv_obj_set_size(hdr, 240, 38);
     lv_obj_set_pos(hdr, 0, 0);
-    lv_obj_set_style_bg_color(hdr, lv_color_hex(0x000010), 0);
+    lv_obj_set_style_bg_color(hdr, lv_color_hex(0x000033), 0);
     lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(hdr, 0, 0);
     lv_obj_set_style_pad_all(hdr, 0, 0);
@@ -901,21 +1181,22 @@ static void createUI() {
     lv_obj_align(lbl_dist, LV_ALIGN_TOP_RIGHT, -4, 100 + SPD_DY);
     lv_label_set_text(lbl_dist, "0km");
 
-    // ── Row4: Fuel bar + Air bar  y=114..132 ──────────────────
-    lv_obj_t *ic_fuel = lv_label_create(scr);
-    lv_obj_set_style_text_font(ic_fuel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ic_fuel, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_pos(ic_fuel, 2, 115 + SPD_DY);
-    lv_label_set_text(ic_fuel, LV_SYMBOL_BATTERY_FULL);
+    // icon fuel + bar + value, icon air + bar + value  y=113..134 ─────────
+    lv_obj_t *ic_fuel = lv_img_create(scr);
+    lv_img_set_src(ic_fuel, &fuel);
+    lv_img_set_zoom(ic_fuel, 90);   // 128% → vừa với bar
+    lv_obj_set_pos(ic_fuel, -5, 120);
+    
 
-    lv_obj_t *ic_air = lv_label_create(scr);
-    lv_obj_set_style_text_font(ic_air, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ic_air, lv_color_hex(0xFFD700), 0);
-    lv_obj_set_pos(ic_air, 122, 115 + SPD_DY);
-    lv_label_set_text(ic_air, LV_SYMBOL_REFRESH);
+
+    lv_obj_t *ic_air = lv_img_create(scr);
+    lv_img_set_src(ic_air, &air);
+    lv_img_set_zoom(ic_air, 135); 
+    lv_obj_set_pos(ic_air, 110, 128);
+  // 128% → vừa với bar   
 
     bar_fuel = lv_bar_create(scr);
-    lv_obj_set_size(bar_fuel, 94, 14);
+    lv_obj_set_size(bar_fuel, 94, 13);
     lv_obj_set_pos(bar_fuel, 20, 116 + SPD_DY);
     lv_bar_set_range(bar_fuel, 0, 1000);
     lv_bar_set_value(bar_fuel, 0, LV_ANIM_OFF);
@@ -933,7 +1214,7 @@ static void createUI() {
     lv_label_set_text(lbl_fuel_val, "0");
 
     bar_air = lv_bar_create(scr);
-    lv_obj_set_size(bar_air, 88, 14);
+    lv_obj_set_size(bar_air, 94, 13);
     lv_obj_set_pos(bar_air, 142, 116 + SPD_DY);
     lv_bar_set_range(bar_air, 0, 150);
     lv_bar_set_value(bar_air, 0, LV_ANIM_OFF);
@@ -978,49 +1259,49 @@ static void createUI() {
 
     static lv_obj_t *icon_row;
 
-// ... trong createUI(), thay cho 3 đoạn tạo icon cũ:
-icon_row = lv_obj_create(scr);
-lv_obj_remove_style_all(icon_row);
-lv_obj_set_size(icon_row, 160, 30);
-lv_obj_set_pos(icon_row, 240 - 160, 200);          // mép phải container = mép phải màn hình
-lv_obj_clear_flag(icon_row, LV_OBJ_FLAG_SCROLLABLE);
+    icon_row = lv_obj_create(scr);
+    lv_obj_remove_style_all(icon_row);
+    lv_obj_set_size(icon_row, 160, 30);
+    lv_obj_set_pos(icon_row, 240 - 160, 200);          // mép phải container = mép phải màn hình
+    lv_obj_clear_flag(icon_row, LV_OBJ_FLAG_SCROLLABLE);
 
-lv_obj_set_flex_flow(icon_row, LV_FLEX_FLOW_ROW);
-lv_obj_set_flex_align(icon_row,
-    LV_FLEX_ALIGN_END,      // main axis: dồn về cạnh PHẢI
-    LV_FLEX_ALIGN_CENTER,   // cross axis
-    LV_FLEX_ALIGN_CENTER);
-lv_obj_set_style_pad_column(icon_row, 2, 0);
+    lv_obj_set_flex_flow(icon_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(icon_row,
+        LV_FLEX_ALIGN_END,      // main axis: dồn về cạnh PHẢI
+        LV_FLEX_ALIGN_CENTER,   // cross axis
+        LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(icon_row, 2, 0);
 
-// Thứ tự tạo = từ trái sang phải
-icon_highbeam = lv_img_create(icon_row);
-lv_img_set_src(icon_highbeam, &_40x30_hightbeam);
-lv_obj_add_flag(icon_highbeam, LV_OBJ_FLAG_HIDDEN);
+    // Thứ tự tạo = từ trái sang phải
+    icon_highbeam = lv_img_create(icon_row);
+    lv_img_set_src(icon_highbeam, &_40x30_hightbeam);
+    lv_obj_add_flag(icon_highbeam, LV_OBJ_FLAG_HIDDEN);
 
-icon_lowbeam = lv_img_create(icon_row);
-lv_img_set_src(icon_lowbeam, &_40x30_lowbeam);
-lv_obj_add_flag(icon_lowbeam, LV_OBJ_FLAG_HIDDEN);
-
-icon_park = lv_img_create(icon_row);
-lv_img_set_src(icon_park, &park);
-    //code  cũ
-   /*  icon_park = lv_img_create(scr);
-    lv_obj_set_pos(icon_park, 200, 200); 
-    lv_img_set_src(icon_park, &park);
- //// code
-    icon_lowbeam = lv_img_create(scr);
+    icon_lowbeam = lv_img_create(icon_row);
     lv_img_set_src(icon_lowbeam, &_40x30_lowbeam);
- //   lv_img_set_zoom(icon_lowbeam, 128);
-    lv_obj_set_pos(icon_lowbeam, 158, 200);
     lv_obj_add_flag(icon_lowbeam, LV_OBJ_FLAG_HIDDEN);
 
-    icon_highbeam = lv_img_create(scr);
-    lv_img_set_src(icon_highbeam, &_40x30_hightbeam);
-   // lv_img_set_zoom(icon_highbeam, 128);
-    lv_obj_set_pos(icon_highbeam, 116, 200);
-    lv_obj_add_flag(icon_highbeam, LV_OBJ_FLAG_HIDDEN);
-  */
+    icon_park = lv_img_create(icon_row);
+    lv_img_set_src(icon_park, &park);
+    
+        //code  cũ
+    /*  icon_park = lv_img_create(scr);
+        lv_obj_set_pos(icon_park, 200, 200); 
+        lv_img_set_src(icon_park, &park);
+    //// code
+        icon_lowbeam = lv_img_create(scr);
+        lv_img_set_src(icon_lowbeam, &_40x30_lowbeam);
+    //   lv_img_set_zoom(icon_lowbeam, 128);
+        lv_obj_set_pos(icon_lowbeam, 158, 200);
+        lv_obj_add_flag(icon_lowbeam, LV_OBJ_FLAG_HIDDEN);
 
+        icon_highbeam = lv_img_create(scr);
+        lv_img_set_src(icon_highbeam, &_40x30_hightbeam);
+    // lv_img_set_zoom(icon_highbeam, 128);
+        lv_obj_set_pos(icon_highbeam, 116, 200);
+        lv_obj_add_flag(icon_highbeam, LV_OBJ_FLAG_HIDDEN);
+    */
+    //
     // ── Divider đỏ y=212 ──────────────────────────────────────
     make_divider(scr, 280, lv_color_hex(0xCC2200));
 
@@ -1050,15 +1331,66 @@ lv_img_set_src(icon_park, &park);
     lv_obj_set_style_text_color(lbl_income, lv_color_hex(0xFFD700), 0);
     lv_label_set_text(lbl_income, "$:0");
     lv_obj_align(lbl_income, LV_ALIGN_BOTTOM_RIGHT, -4, 0);
-
+        // ── Speed limit icon + value  y=282..319 ─────────────────────
     spd_limit = lv_img_create(scr);
     
     lv_img_set_src(spd_limit, &sp30);
-    lv_obj_align_to(spd_limit,lbl_trl_prefix,LV_ALIGN_OUT_TOP_LEFT, -5, -10); 
+    lv_obj_align_to(spd_limit,lbl_trl_prefix,LV_ALIGN_OUT_TOP_LEFT, -3, -10); 
     /* test = lv_label_create(scr);
     lv_obj_align_to(test,spd_limit,LV_ALIGN_OUT_RIGHT_TOP,5,5);
    // lv_label_set_text(test, "0"); */
 
+    lv_obj_t *limit_draw = lv_obj_create(scr);
+    lv_obj_set_size(limit_draw, 40, 40);
+    lv_obj_align_to(limit_draw, spd_limit, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+    lv_obj_set_style_bg_color(limit_draw, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_pad_all(limit_draw, 0, 0);
+    lv_obj_set_style_radius(limit_draw, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(limit_draw, 5, 0);       // Độ dày viền
+    lv_obj_set_style_border_color(limit_draw, lv_color_hex(0xf00), 0); 
+
+    limit_val = lv_label_create(limit_draw);
+    lv_obj_set_style_text_font(limit_val, &roboto, 0);
+    lv_obj_set_style_text_color(limit_val, lv_color_hex(0x000000), 0);
+    lv_label_set_text(limit_val, "0");
+    lv_obj_align(limit_val, LV_ALIGN_CENTER, 0, 0);
+
+    encoder_page_panel = lv_obj_create(scr);
+    lv_obj_set_pos(encoder_page_panel, 0, 130);
+    lv_obj_set_size(encoder_page_panel, 240, 148);
+    lv_obj_set_style_bg_color(encoder_page_panel, lv_color_hex(0x000033), 0);
+    lv_obj_set_style_bg_opa(encoder_page_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(encoder_page_panel, 0, 0);
+    lv_obj_set_style_radius(encoder_page_panel, 0, 0);
+    lv_obj_set_style_pad_all(encoder_page_panel, 0, 0);
+    lv_obj_clear_flag(encoder_page_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(encoder_page_panel, LV_OBJ_FLAG_HIDDEN);
+
+    encoder_page_title = createEncoderPageLabel(
+        encoder_page_panel, 6, 2, 228, lv_color_hex(0x00CCFF));
+    lv_label_set_text(encoder_page_title, "ENGINE  2/3");
+
+    const lv_color_t engineColor = lv_color_hex(0xFFFFFF);
+    engine_page_values[0] = createEncoderPageLabel(encoder_page_panel, 6, 20, 108, lv_color_hex(0x00CC66));
+    engine_page_values[1] = createEncoderPageLabel(encoder_page_panel, 122, 20, 108, lv_color_hex(0xFFD700));
+    engine_page_values[2] = createEncoderPageLabel(encoder_page_panel, 6, 32, 108, lv_color_hex(0xFF9900));
+    engine_page_values[3] = createEncoderPageLabel(encoder_page_panel, 122, 32, 108, lv_color_hex(0x00AAFF));
+    engine_page_values[4] = createEncoderPageLabel(encoder_page_panel, 6, 44, 108, engineColor);
+    engine_page_values[5] = createEncoderPageLabel(encoder_page_panel, 122, 44, 108, lv_color_hex(0xFF4444));
+    engine_page_values[6] = createEncoderPageLabel(encoder_page_panel, 6, 56, 108, engineColor);
+    engine_page_values[7] = createEncoderPageLabel(encoder_page_panel, 122, 56, 108, engineColor);
+
+    trip_page_values[0] = createEncoderPageLabel(encoder_page_panel, 6, 20, 228, lv_color_hex(0xFFFFFF));
+    trip_page_values[1] = createEncoderPageLabel(encoder_page_panel, 6, 34, 108, lv_color_hex(0xFFD700));
+    trip_page_values[2] = createEncoderPageLabel(encoder_page_panel, 122, 34, 108, lv_color_hex(0x00CCFF));
+    trip_page_values[3] = createEncoderPageLabel(encoder_page_panel, 6, 48, 228, lv_color_hex(0xFFFFFF));
+    trip_page_values[4] = createEncoderPageLabel(encoder_page_panel, 6, 62, 108, lv_color_hex(0x88CC00));
+    trip_page_values[5] = createEncoderPageLabel(encoder_page_panel, 122, 62, 108, lv_color_hex(0x88CC00));
+    for (lv_obj_t *label : trip_page_values) {
+        lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_move_foreground(spd_limit);
+    lv_obj_move_foreground(limit_draw);
 
     Serial.println("[UI] Widgets created OK");
 }
@@ -1312,23 +1644,97 @@ static void refreshUI() {
      if (navigation.speed_limit != lass_spd_limit )
      {
         lass_spd_limit = navigation.speed_limit;
-        // Gọi
+        // Gọi hàm lv_img_set_src() để thay đổi hình ảnh hiển thị
             int idx = (navigation.speed_limit - 30) / 10;  // 30→0, 40→1, ...
             if (idx >= 0 && idx <= 6) {
                 lv_img_set_src(spd_limit, speed_imgs[idx]);
             }
+           snprintf(buf, sizeof(buf), "$:%d", navigation.speed_limit);
+            lv_label_set_text(limit_val, buf); 
   
      }
 
     static unsigned long last_read_vol = 0;
     if (millis() - last_read_vol > 1000) {
-        int adcValue = analogRead(BAT_ADC_PIN);
-        float batteryVoltage = analogReadMilliVolts(BAT_ADC_PIN) * 2.0 / 1000.0;
-        
-         snprintf(buf, sizeof(buf), "%.2f V",batteryVoltage);
-         lv_label_set_text(lbl_vol,buf);
-        Serial.printf("Battery: %.2fV\n", batteryVoltage);
+        BatteryReading batteryReading;
+        if (readBatteryMonitor(batteryReading)) {
+            const float currentA = batteryReading.currentValid
+                ? batteryReading.currentMa / 1000.0f
+                : 0.0f;
+            const float powerW = batteryReading.currentValid
+                ? batteryReading.voltageV * currentA
+                : 0.0f;
+            const char* state =
+                batteryReading.currentValid
+                    ? (batteryReading.currentMa > 50.0f ? "DISCHARGING" :
+                       (batteryReading.currentMa < -50.0f ? "CHARGING" : "IDLE"))
+                    : "UNKNOWN";
+            snprintf(buf, sizeof(buf), "%.2f %+.2f", batteryReading.voltageV, currentA);
+            lv_label_set_text(lbl_vol, buf);
+            Serial.printf("[BATTERY] LIVE V=%.2fV I=%+.2fA P=%+.2fW state=%s SoC=%s%% cellTemp=%s monitorTemp=%s\n",
+                          batteryReading.voltageV,
+                          currentA,
+                          powerW,
+                          state,
+                          batteryReading.socValid ? String(batteryReading.estimatedSocPercent, 0).c_str() : "n/a",
+                          batteryReading.cellTempC > -500.0f ? String(batteryReading.cellTempC, 1).c_str() : "n/a",
+                          batteryReading.monitorTempC > -500.0f ? String(batteryReading.monitorTempC, 1).c_str() : "n/a");
+        } else {
+            lv_label_set_text(lbl_vol, "--");
+           // Serial.println("[BATTERY] Measurement unavailable");
+        }
         last_read_vol = millis();
+    }
+
+    if (encoderPage == 1) {
+        char gearText[8];
+        char valueText[48];
+        if (truck.displayedGear < 0) {
+            snprintf(gearText, sizeof(gearText), "R%d", abs(truck.displayedGear));
+        } else if (truck.displayedGear == 0) {
+            snprintf(gearText, sizeof(gearText), "N");
+        } else {
+            snprintf(gearText, sizeof(gearText), "%d", truck.displayedGear);
+        }
+
+        snprintf(valueText, sizeof(valueText), "RPM: %d", truck.rpm);
+        setLabelTextIfChanged(engine_page_values[0], valueText);
+        snprintf(valueText, sizeof(valueText), "Gear: %s", gearText);
+        setLabelTextIfChanged(engine_page_values[1], valueText);
+        snprintf(valueText, sizeof(valueText), "Oil: %d C", truck.oilTemperature);
+        setLabelTextIfChanged(engine_page_values[2], valueText);
+        snprintf(valueText, sizeof(valueText), "Coolant: %d C", truck.waterTemperature);
+        setLabelTextIfChanged(engine_page_values[3], valueText);
+        snprintf(valueText, sizeof(valueText), "Engine: %s", truck.engineOn ? "ON" : "OFF");
+        setLabelTextIfChanged(engine_page_values[4], valueText);
+        snprintf(valueText, sizeof(valueText), "Check: %s", truck.checkEngOn ? "ON" : "OFF");
+        setLabelTextIfChanged(engine_page_values[5], valueText);
+        snprintf(valueText, sizeof(valueText), "Cruise: %s", truck.speedCtrlOn ? "ON" : "OFF");
+        setLabelTextIfChanged(engine_page_values[6], valueText);
+        snprintf(valueText, sizeof(valueText), "Cruise set: %d", truck.speedCtrl);
+        setLabelTextIfChanged(engine_page_values[7], valueText);
+    } else if (encoderPage == 2) {
+        char trailerName[30];
+        char valueText[64];
+        if (trailer.attached && trailer.name.length() > 0) {
+            snprintf(trailerName, sizeof(trailerName), "Trailer: %.22s", trailer.name.c_str());
+        } else {
+            snprintf(trailerName, sizeof(trailerName), "Trailer: none");
+        }
+        snprintf(valueText, sizeof(valueText), "Time left: %s",
+                 job.remainingTime.length() ? job.remainingTime.c_str() : "--");
+        setLabelTextIfChanged(trip_page_values[0], valueText);
+        snprintf(valueText, sizeof(valueText), "Income: $%d", job.income);
+        setLabelTextIfChanged(trip_page_values[1], valueText);
+        snprintf(valueText, sizeof(valueText), "Distance: %d km",
+                 navigation.estimatedDistance);
+        setLabelTextIfChanged(trip_page_values[2], valueText);
+        setLabelTextIfChanged(trip_page_values[3], trailerName);
+        snprintf(valueText, sizeof(valueText), "Mass: %d t", trailer.mass / 1000);
+        setLabelTextIfChanged(trip_page_values[4], valueText);
+        snprintf(valueText, sizeof(valueText), "Wear: %d%% / %d%%",
+                 trailer.wear, trailer.cargoWear);
+        setLabelTextIfChanged(trip_page_values[5], valueText);
     }
 
 }
@@ -1439,16 +1845,12 @@ static void refreshUIOLD() {
 // 7. setupDisplay — gọi từ setup() trong main.cpp
 // ════════════════════════════════════════════════════════
 void setupDisplay() {
-    // ── TFT_eSPI init ─────────────────────────────────────────
+    // ── LovyanGFX init ─────────────────────────────────────────
     tft.init();
+    tft.setBrightness(255);
     tft.setRotation(2);
-    tft.setSwapBytes(true);
-    tft.fillScreen(TFT_BLACK);
-
-#ifdef TFT_BL
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, HIGH);
-#endif
+    tft.fillScreen(0x0000);
+    loadSavedAccessPin(configuredAccessPin, sizeof(configuredAccessPin));
 
     Serial.println("[TFT] Init OK");
     Serial.println("[PSRAM] Free: " + String(ESP.getFreePsram()));
@@ -1474,11 +1876,27 @@ void setupDisplay() {
    // lv_disp_draw_buf_init(&draw_buf, lvgl_buf1, lvgl_buf2, BUF_SIZE);
 
     lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res  = 240;
-    disp_drv.ver_res  = 320;
+    disp_drv.hor_res  = LVGL_HOR_RES;
+    disp_drv.ver_res  = LVGL_VER_RES;
     disp_drv.flush_cb = flush_cb;
     disp_drv.draw_buf = &draw_buf;
     lv_disp_drv_register(&disp_drv);
+
+    setupRotaryEncoder();
+    createAccessPinScreen();
+    lv_scr_load(accessPinScreen);
+    while (!accessGranted) {
+        pollRotaryEncoder();
+        lv_timer_handler();
+        delay(5);
+    }
+
+    lv_obj_t *dashboardBaseScreen = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(dashboardBaseScreen, lv_color_hex(0x000033), 0);
+    lv_obj_set_style_bg_opa(dashboardBaseScreen, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(dashboardBaseScreen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_scr_load(dashboardBaseScreen);
+
     showBootSequence();
     Serial.println("[LVGL] Init OK");
 
@@ -1564,7 +1982,8 @@ static void updateOtaScreen() {
         else if (millis() - ota_err_since > 3000) {          // báo lỗi 3s rồi quay lại dashboard
             otaState = 0;
             ota_err_since = 0;
-            lv_scr_load(in_idle ? idle_scr : ui_scr);
+            lv_scr_load(!accessGranted ? accessPinScreen :
+                        (in_idle ? idle_scr : ui_scr));
             lv_obj_del(ota_scr);
             ota_scr = nullptr;
         }
@@ -1583,6 +2002,8 @@ void DisplayTask(void* parameter) {
 
     for (;;) {
         unsigned long now = millis();
+        pollRotaryEncoder();
+        reportDisplayPerformance(now);
         updateRescueIndicators();
 
         if (now - lastTFTUpdate >= TFT_UPDATE_INTERVAL) {
@@ -1598,7 +2019,8 @@ void DisplayTask(void* parameter) {
 
             // Đọc data có mutex
             cycleTelemetrySnapshotValid = false;
-            if (xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            if (accessGranted &&
+                xSemaphoreTake(dataAccessMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 updateScreenMode();          // chọn dashboard / ảnh chờ
                 if (!in_idle) {
                     const uint32_t uiStartedUs = micros();

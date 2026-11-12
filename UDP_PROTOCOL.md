@@ -292,15 +292,20 @@ Giải mã:
 ESP32 gửi một gói JSON riêng tới `192.168.222.49:8888` sau khi kết nối Wi-Fi:
 
 ```json
-{"voltage_v":4.12,"wake":"timer","time":"2026-10-31T14:25:30+07:00","time_valid":true}
+{"voltage_v":3.93,"wake":"timer","current_ma":290.0,"current_a":0.29,"power_w":1.15,"current_display":"+0.29A","time":"2026-10-31T14:25:30+07:00","time_valid":true}
 ```
 
 - `voltage_v`: điện áp pin tính bằng volt.
 - `wake`: `boot` khi khởi động thông thường, `timer` khi thức dậy từ deep sleep.
+- `current_ma`: dòng điện mA khi dùng INA219; là `null` khi dùng ADC.
+- `current_a`: dòng điện ampere khi dùng INA219; là `null` khi dùng ADC.
+- `current_display`: chuỗi dòng điện có dấu tường minh, ví dụ `+0.29A` hoặc `-0.29A`; là `N/A` khi dùng ADC.
+- `power_w`: công suất watt (`voltage_v × current_a`) khi dùng INA219; là `null` khi dùng ADC.
 - `time`: giờ địa phương ICT (UTC+07:00) theo ISO 8601; là `null` nếu chưa có giờ hợp lệ.
 - `time_valid`: cho biết `time` có hợp lệ hay không.
+- Khi điện áp dưới ngưỡng bảo vệ 2,98 V lúc timer-wake, gói có thêm trường `"event":"penaty powerlot, shut down"`; ESP32 sau đó vào deep sleep không hẹn giờ.
 
-Trong lần khởi động thông thường, ESP32 đồng bộ NTP một lần (tối đa 8 giây) rồi gửi báo cáo. Khi thức dậy bằng timer, thiết bị khôi phục giờ đã lưu trong RTC và không đồng bộ NTP lại. Báo cáo này có thể bật/tắt bằng `ENABLE_BATTERY_UDP_REPORT`; đích IP và cổng được cấu hình trong firmware.
+Chọn nguồn đo bằng `BATTERY_MEASUREMENT_SOURCE`: `BATTERY_SOURCE_ADC` (mặc định) hoặc `BATTERY_SOURCE_INA219`. Khi chọn INA219, I²C dùng SDA GPIO 8, SCL GPIO 9 và địa chỉ 0x40 theo mặc định. Trong lần khởi động thông thường, ESP32 đồng bộ NTP một lần (tối đa 8 giây) rồi gửi báo cáo. Khi thức dậy bằng timer, thiết bị khôi phục giờ đã lưu trong RTC và không đồng bộ NTP lại. Báo cáo có thể bật/tắt bằng `ENABLE_BATTERY_UDP_REPORT`; bảo vệ pin có thể bật/tắt bằng `ENABLE_BATTERY_LOW_SHUTDOWN`.
 
 
 ## 13. Giới hạn đã biết

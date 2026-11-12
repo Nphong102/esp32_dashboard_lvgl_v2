@@ -80,6 +80,12 @@ void handleRoot() {
         "<label>Địa chỉ telemetry<input name='server_url' type='url' maxlength='192' "
         "placeholder='http://192.168.1.100:25555' required></label>"
         "<div class='actions'><button type='submit'>Lưu cấu hình &amp; khởi động lại</button></div></form></section>"
+        "<section class='card'><h2>Mã PIN khởi động</h2>"
+        "<p class='hint'>Mã gồm đúng 4 chữ số, mặc định là 3258. Mã mới có hiệu lực từ lần khởi động kế tiếp.</p>"
+        "<form method='post' action='/pin'>"
+        "<label>Mã PIN mới<input name='pin' type='password' inputmode='numeric' pattern='[0-9]{4}' "
+        "minlength='4' maxlength='4' autocomplete='new-password' required></label>"
+        "<div class='actions'><button type='submit'>Lưu mã PIN</button></div></form></section>"
         "<section class='card'><h2>Cập nhật firmware</h2>"
         "<p class='hint'>Chọn đúng file firmware <b>.bin</b>. Không ngắt nguồn trong khi cập nhật.</p>"
         "<form id='uploadForm' enctype='multipart/form-data'>"
@@ -169,6 +175,37 @@ void handleSettings() {
     rescueServer.send(200, "text/plain", "Settings saved; restarting");
     delay(500);
     ESP.restart();
+}
+
+void handleAccessPin() {
+    if (!authenticateRequest()) return;
+
+    const String pin = rescueServer.arg("pin");
+    if (pin.length() != 4 ||
+        !isDigit(pin[0]) || !isDigit(pin[1]) ||
+        !isDigit(pin[2]) || !isDigit(pin[3])) {
+        rescueServer.send(400, "text/plain; charset=utf-8",
+                          "PIN must contain exactly four digits");
+        return;
+    }
+
+    Preferences preferences;
+    if (!preferences.begin(kPreferencesNamespace, false)) {
+        rescueServer.send(500, "text/plain; charset=utf-8",
+                          "Could not open settings storage");
+        return;
+    }
+    preferences.putString("boot_pin", pin);
+    const bool saved = preferences.getString("boot_pin", String()) == pin;
+    preferences.end();
+
+    if (!saved) {
+        rescueServer.send(500, "text/plain; charset=utf-8",
+                          "Could not save PIN");
+        return;
+    }
+    rescueServer.send(200, "text/plain; charset=utf-8",
+                      "PIN saved. It will be used after the next restart.");
 }
 
 void handleFirmwareUpload() {
@@ -342,6 +379,28 @@ void loadSavedNetworkSettings() {
     preferences.end();
 }
 
+bool loadSavedAccessPin(char* output, size_t outputSize) {
+    if (output == nullptr || outputSize < 5) return false;
+    snprintf(output, outputSize, "3258");
+
+    Preferences preferences;
+    if (!preferences.begin(kPreferencesNamespace, true)) {
+        Serial.println("[AUTH] Settings storage unavailable; using default PIN");
+        return false;
+    }
+
+    const String savedPin = preferences.getString("boot_pin", "3258");
+    preferences.end();
+    if (savedPin.length() != 4 ||
+        !isDigit(savedPin[0]) || !isDigit(savedPin[1]) ||
+        !isDigit(savedPin[2]) || !isDigit(savedPin[3])) {
+        Serial.println("[AUTH] Stored PIN invalid; using default PIN");
+        return false;
+    }
+    memcpy(output, savedPin.c_str(), 5);
+    return true;
+}
+
 bool startRescueButtonMonitor() {
     if (rescueButtonTaskHandle != nullptr) return true;
 
@@ -375,6 +434,7 @@ bool startRescueMode() {
 
     rescueServer.on("/", HTTP_GET, handleRoot);
     rescueServer.on("/settings", HTTP_POST, handleSettings);
+    rescueServer.on("/pin", HTTP_POST, handleAccessPin);
     rescueServer.on("/restart", HTTP_POST, handleRestart);
     rescueServer.on("/update", HTTP_POST, handleFirmwareUpload, processFirmwareUpload);
     rescueServer.begin();

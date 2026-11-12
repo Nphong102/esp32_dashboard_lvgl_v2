@@ -17,7 +17,7 @@ char        WIFI_PASSWORD[65]  = WIFI_PASSWORD_VALUE;
 char        TRUCK_DATA_URL[193] = TRUCK_DATA_URL_VALUE;
 
 // ── Hardware ────────────────────────────────────────────────
-TFT_eSPI tft = TFT_eSPI();
+LGFX tft;
 
 // ── FreeRTOS ────────────────────────────────────────────────
 TaskHandle_t      WiFiTaskHandle    = nullptr;

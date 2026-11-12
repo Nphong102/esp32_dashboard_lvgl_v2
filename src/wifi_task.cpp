@@ -511,57 +511,98 @@ bool waitForTelemetryUdp(uint32_t timeoutMs) {
     return false;
 }
 
-void sendBatteryVoltageUdpReport() {
+bool sendBatteryVoltageUdpReport(const BatteryReading* reading,
+                                 const char* event) {
 #if ENABLE_BATTERY_UDP_REPORT
-    if (batteryReportSent || WiFi.status() != WL_CONNECTED) return;
+    if (batteryReportSent || WiFi.status() != WL_CONNECTED) return false;
 
     const uint32_t now = millis();
     if (batteryReportAttempted &&
         now - lastBatteryReportAttemptMs < 1000) {
-        return;
+        return false;
     }
     batteryReportAttempted = true;
     lastBatteryReportAttemptMs = now;
 
-    const float batteryVoltage =
-        analogReadMilliVolts(BAT_ADC_PIN) * 2.0f / 1000.0f;
+    BatteryReading measuredReading;
+    if (reading == nullptr) {
+        if (!readBatteryMonitor(measuredReading)) {
+          //  Serial.println("[BATTERY UDP] Could not read battery measurement");
+            return false;
+        }
+        reading = &measuredReading;
+    }
+
     const char* wakeCause =
         esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER ? "timer" : "boot";
 
     char timestamp[32];
     const bool timeValid =
         getCurrentLocalDateTime(timestamp, sizeof(timestamp));
-    char packet[128];
-    const int packetLength = timeValid
-        ? snprintf(packet, sizeof(packet),
-                   "{\"voltage_v\":%.2f,\"wake\":\"%s\","
-                   "\"time\":\"%s\",\"time_valid\":true}",
-                   batteryVoltage, wakeCause, timestamp)
-        : snprintf(packet, sizeof(packet),
-                   "{\"voltage_v\":%.2f,\"wake\":\"%s\","
-                   "\"time\":null,\"time_valid\":false}",
-                   batteryVoltage, wakeCause);
+    char currentMilliAmpsValue[20];
+    char currentAmpsValue[20];
+    char powerWattsValue[20];
+    char currentDisplayValue[24];
+    if (reading->currentValid) {
+        snprintf(currentMilliAmpsValue, sizeof(currentMilliAmpsValue), "%.1f",
+                 reading->currentMa);
+        snprintf(currentAmpsValue, sizeof(currentAmpsValue), "%.2f",
+                 reading->currentMa / 1000.0f);
+        snprintf(powerWattsValue, sizeof(powerWattsValue), "%.2f",
+                 reading->powerW);
+        snprintf(currentDisplayValue, sizeof(currentDisplayValue), "%+.2fA",
+                 reading->currentMa / 1000.0f);
+    } else {
+        snprintf(currentMilliAmpsValue, sizeof(currentMilliAmpsValue), "null");
+        snprintf(currentAmpsValue, sizeof(currentAmpsValue), "null");
+        snprintf(powerWattsValue, sizeof(powerWattsValue), "null");
+        snprintf(currentDisplayValue, sizeof(currentDisplayValue), "N/A");
+    }
+
+    char eventField[80] = "";
+    if (event != nullptr && event[0] != '\0') {
+        snprintf(eventField, sizeof(eventField), ",\"event\":\"%s\"", event);
+    }
+
+    char packet[256];
+    const int packetLength = snprintf(
+        packet, sizeof(packet),
+        "{\"voltage_v\":%.2f,\"wake\":\"%s\",\"current_ma\":%s,"
+        "\"current_a\":%s,\"power_w\":%s,\"current_display\":\"%s\","
+        "\"time\":%s%s%s,\"time_valid\":%s%s}",
+        reading->voltageV, wakeCause, currentMilliAmpsValue,
+        currentAmpsValue, powerWattsValue, currentDisplayValue,
+        timeValid ? "\"" : "", timeValid ? timestamp : "null",
+        timeValid ? "\"" : "", timeValid ? "true" : "false", eventField);
     if (packetLength <= 0 || packetLength >= (int)sizeof(packet)) {
         Serial.println("[BATTERY UDP] Could not format report");
-        return;
+        return false;
     }
 
     const IPAddress receiverIp(192, 168, 222, 49);
     if (!batteryReportUdp.beginPacket(receiverIp, BATTERY_UDP_REPORT_PORT)) {
         Serial.println("[BATTERY UDP] Could not start packet");
-        return;
+        return false;
     }
 
     batteryReportUdp.write((const uint8_t*)packet, (size_t)packetLength);
     if (batteryReportUdp.endPacket()) {
         batteryReportSent = true;
         Serial.printf("[BATTERY UDP] Sent %.2f V to 192.168.222.49:%u "
-                      "(%s, time=%s)\n",
-                      batteryVoltage, (unsigned)BATTERY_UDP_REPORT_PORT,
-                      wakeCause, timeValid ? timestamp : "unavailable");
+                      "(%s, I=%s A, P=%s W, time=%s%s)\n",
+                      reading->voltageV, (unsigned)BATTERY_UDP_REPORT_PORT,
+                      wakeCause, currentAmpsValue, powerWattsValue,
+                      timeValid ? timestamp : "unavailable",
+                      event != nullptr ? ", shutdown event" : "");
+        return true;
     } else {
         Serial.println("[BATTERY UDP] Send failed; will retry");
+        return false;
     }
+#else
+    (void)reading;
+    (void)event;
+    return false;
 #endif
 }
 
@@ -605,6 +646,29 @@ void enterLowPowerSleep(const char* reason) {
         return;
     }
 
+    Serial.flush();
+    esp_deep_sleep_start();
+}
+
+void enterBatteryProtectionSleep(const char* reason) {
+    Serial.printf("[POWER] %s\n", reason);
+
+    if (telemetryUdpStarted) {
+        telemetryUdp.stop();
+        telemetryUdpStarted = false;
+    }
+
+#ifdef TFT_BL
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, LOW);
+#endif
+
+    ledcWrite(BUZZER_LEDC_CHANNEL, 0);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+    Serial.println("[POWER] Entering deep sleep with no timer wake source");
     Serial.flush();
     esp_deep_sleep_start();
 }

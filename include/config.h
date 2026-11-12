@@ -10,7 +10,7 @@
 #include <ArduinoJson.h>
 #endif
 #include <SPI.h>
-#include <TFT_eSPI.h>
+#include "lgfx_config.h"
 #include <lvgl.h>
 
 // ==================== WiFi / Network ====================
@@ -29,8 +29,46 @@ extern char        TRUCK_DATA_URL[193];
 #define NTP_SERVER_SECONDARY    "time.google.com"
 #define RESCUE_BOOT_PIN         0
 #define RESCUE_BOOT_HOLD_MS     2000
-#define BUZZER_PIN              2
+#ifndef BUZZER_PIN
+#define BUZZER_PIN              1
+#endif
 #define BUZZER_LEDC_CHANNEL     7
+#ifndef ENCODER_A_PIN
+#define ENCODER_A_PIN           2
+#endif
+#ifndef ENCODER_B_PIN
+#define ENCODER_B_PIN           3
+#endif
+#ifndef ENCODER_SW_PIN
+#define ENCODER_SW_PIN          14
+#endif
+#ifndef ENABLE_BATTERY_LEVEL_BEEP
+#define ENABLE_BATTERY_LEVEL_BEEP 1
+#endif
+#define BATTERY_SOURCE_ADC      0
+#define BATTERY_SOURCE_INA219   1
+#ifndef BATTERY_MEASUREMENT_SOURCE
+#define BATTERY_MEASUREMENT_SOURCE BATTERY_SOURCE_INA219
+#endif
+#if BATTERY_MEASUREMENT_SOURCE != BATTERY_SOURCE_ADC && \
+    BATTERY_MEASUREMENT_SOURCE != BATTERY_SOURCE_INA219
+#error "BATTERY_MEASUREMENT_SOURCE must be BATTERY_SOURCE_ADC or BATTERY_SOURCE_INA219"
+#endif
+#define BATTERY_ADC_DIVIDER_RATIO 2.0f
+#ifndef BATTERY_I2C_SDA_PIN
+#define BATTERY_I2C_SDA_PIN     21
+#endif
+#ifndef BATTERY_I2C_SCL_PIN
+#define BATTERY_I2C_SCL_PIN     22
+#endif
+#define BATTERY_INA219_ADDRESS  0x40
+#ifndef ENABLE_BATTERY_I2C_SCAN
+#define ENABLE_BATTERY_I2C_SCAN 1
+#endif
+#define BATTERY_LOW_SHUTDOWN_VOLTAGE 2.98f
+#ifndef ENABLE_BATTERY_LOW_SHUTDOWN
+#define ENABLE_BATTERY_LOW_SHUTDOWN 1
+#endif
 #define ENABLE_BATTERY_UDP_REPORT 1
 #define BATTERY_UDP_REPORT_PORT 8888
 #define TELEMETRY_UDP_PORT     4210
@@ -42,8 +80,8 @@ extern TaskHandle_t     WiFiTaskHandle;
 extern TaskHandle_t     DisplayTaskHandle;
 extern SemaphoreHandle_t dataAccessMutex;
 
-// ==================== Global TFT object ====================
-extern TFT_eSPI tft;
+// ==================== Global display object ====================
+extern LGFX tft;
 
 // ==================== Timing ====================
 extern unsigned long lastWiFiUpdate;
