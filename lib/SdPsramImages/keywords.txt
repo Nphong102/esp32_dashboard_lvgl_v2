@@ -1,0 +1,55 @@
+#######################################
+# Syntax Coloring Map For SdPsramImages
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+SdCard	KEYWORD1
+SdPins	KEYWORD1
+ImageStore	KEYWORD1
+PsramImage	KEYWORD1
+Err	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+begin	KEYWORD2
+mkdir	KEYWORD2
+end	KEYWORD2
+setLog	KEYWORD2
+loadFile	KEYWORD2
+loadDir	KEYWORD2
+clear	KEYWORD2
+count	KEYWORD2
+get	KEYWORD2
+find	KEYWORD2
+bytesUsed	KEYWORD2
+errStr	KEYWORD2
+toLvglDsc	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+Ok	LITERAL1
+OpenFail	LITERAL1
+TooSmall	LITERAL1
+NoPsram	LITERAL1
+ReadFail	LITERAL1
+BadHeader	LITERAL1
+Full	LITERAL1
+SDPSRAM_LVGL	LITERAL1
+LvImageSet	KEYWORD1
+findIndex	KEYWORD2
+sortByName	KEYWORD2
+hasAlpha	KEYWORD2
+FileEntry	KEYWORD1
+listDir	KEYWORD2
+unloadAt	KEYWORD2
+unload	KEYWORD2
+removeFile	KEYWORD2
+deleteFile	KEYWORD2
+loadFromList	KEYWORD2
+saveList	KEYWORD2
+isLoaded	KEYWORD2
+setUser	KEYWORD2

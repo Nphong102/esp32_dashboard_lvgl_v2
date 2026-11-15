@@ -23,6 +23,63 @@
 #include <esp_sleep.h>
 #include <driver/gpio.h>
 #include <string.h>
+//add new fuction
+#define SDPSRAM_LVGL
+#include <SdPsramImages.h>
+using sdpsram::LvImageSet; using sdpsram::SdCard; using sdpsram::SdPins;
+
+static LvImageSet bigImgs(14);    // ảnh đã chọn cho logo boot và slideshow chờ
+static LvImageSet icons(32);
+static RescueDisplayImageSettings displayImageSettings;
+
+static bool isSafeSdImageName(const String& name) {
+    const bool hasBinExtension = name.length() >= 4 &&
+        name.substring(name.length() - 4).equalsIgnoreCase(".bin");
+    return !name.isEmpty() && name.length() < 64 &&
+           name.indexOf('/') < 0 && name.indexOf('\\') < 0 &&
+           name.indexOf("..") < 0 && hasBinExtension;
+}
+
+static void loadSelectedBigImage(const String& name) {
+    if (!isSafeSdImageName(name) || bigImgs.find(name.c_str())) return;
+
+    char path[80];
+    snprintf(path, sizeof(path), "/ets/%s", name.c_str());
+    const sdpsram::Err result = bigImgs.loadFile(path, name.c_str());
+    if (result != sdpsram::Err::Ok) {
+        Serial.printf("[SD] Could not load %s: %s\n",
+                      name.c_str(), sdpsram::ImageStore::errStr(result));
+    }
+}
+
+static void loadSelectedBigImages(const String& names) {
+    int start = 0;
+    while (start < names.length()) {
+        int end = names.indexOf('\n', start);
+        if (end < 0) end = names.length();
+        loadSelectedBigImage(names.substring(start, end));
+        start = end + 1;
+    }
+}
+
+static void loadAssetsFromSd() {
+    loadSavedDisplayImageSettings(displayImageSettings);
+    setRescueImageCatalogReady(false);
+    const SdPins pins = {38, 40, 39, 41, 48, 47};     // clk, cmd, d0..d3 (board 2.8")
+    if (!SdCard::begin(pins)) { Serial.println("[SD] mount failed"); return; }
+    bigImgs.store.setLog(&Serial);
+    icons.store.setLog(&Serial);
+    loadSelectedBigImage(displayImageSettings.bootLogo1);
+    loadSelectedBigImage(displayImageSettings.bootLogo2);
+    if (displayImageSettings.useSdIdleImages) {
+        loadSelectedBigImages(displayImageSettings.idleImages);
+    }
+    icons.loadDir("/ets/icons");
+    setRescueImageCatalogReady(true);
+   // for (int i = 0; i < 7; i++) speed_dsc[i] = icons.find(speed_names[i]);
+    Serial.printf("[SD] PSRAM free: %u\n", (unsigned)ESP.getFreePsram());
+}
+//end new function
 LV_IMG_DECLARE(q_res);  
 LV_IMG_DECLARE(IMG_2220Res);
 LV_IMG_DECLARE(qq);
@@ -30,10 +87,10 @@ LV_IMG_DECLARE(qq);
 LV_IMG_DECLARE(x_3);
 LV_IMG_DECLARE(x_4);
 LV_IMG_DECLARE(x_5); */
-LV_IMG_DECLARE(ribi1); 
-LV_IMG_DECLARE(combine); 
-LV_IMG_DECLARE(ribi2);
-LV_IMG_DECLARE(ribi3); 
+//LV_IMG_DECLARE(ribi1);
+//LV_IMG_DECLARE(combine);
+//LV_IMG_DECLARE(ribi2);
+//LV_IMG_DECLARE(ribi3);
 LV_IMG_DECLARE(park); 
 LV_IMG_DECLARE(left);
 LV_IMG_DECLARE(right);
@@ -177,7 +234,7 @@ void showBootSequence() {
 
     // ── Màn hình boot ─────────────────────────────────────────
     boot_scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(boot_scr, lv_color_hex(0X000033), 0);
+    lv_obj_set_style_bg_color(boot_scr, BGCOLOR, 0);
     lv_obj_set_style_bg_opa(boot_scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(boot_scr, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -247,30 +304,47 @@ void showBootSequence() {
     lv_obj_t *logo_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(logo_scr, lv_color_black(), 0);
     lv_obj_t *logo_img = lv_img_create(logo_scr);
-    lv_img_set_src(logo_img, &IMG_2220Res);
+    const lv_img_dsc_t *logo1Source = displayImageSettings.bootLogo1.isEmpty()
+        ? &IMG_2220Res
+        : bigImgs.find(displayImageSettings.bootLogo1.c_str());
+    if (!logo1Source) {
+        Serial.printf("[SD] Selected boot logo 1 unavailable: %s; using built-in logo\n",
+                      displayImageSettings.bootLogo1.c_str());
+        logo1Source = &IMG_2220Res;
+    }
+    lv_img_set_src(logo_img, logo1Source);
     lv_obj_center(logo_img);
     lv_scr_load_anim(logo_scr, LV_SCR_LOAD_ANIM_FADE_IN, 500, 0, false);
     Serial.printf("anh 1 load  psram=%d\n", ESP.getFreePsram());
     unsigned long t = millis();
     while (millis() - t < 2000) { bootLvglHandler(); delay(5); }
 
-    // ── Logo 2 ────────────────────────────────────────────────
-    lv_obj_t *scr_x = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_x, lv_color_black(), 0);
-    lv_obj_t *img_x = lv_img_create(scr_x);
-    lv_img_set_src(img_x, &combine);
-    lv_obj_center(img_x);
-    lv_scr_load_anim(scr_x, LV_SCR_LOAD_ANIM_OVER_RIGHT, 500, 0, false);
-    Serial.printf("anh 2  load  psram=%d\n", ESP.getFreePsram());
-    t = millis();
-    while (millis() - t < 5000) { bootLvglHandler(); delay(5); }
+    lv_obj_t *scr_x = nullptr;
+    if (!displayImageSettings.bootLogo2.isEmpty()) {
+        const lv_img_dsc_t *logo2Source =
+            bigImgs.find(displayImageSettings.bootLogo2.c_str());
+        if (logo2Source) {
+            scr_x = lv_obj_create(NULL);
+            lv_obj_set_style_bg_color(scr_x, lv_color_black(), 0);
+            lv_obj_t *img_x = lv_img_create(scr_x);
+            lv_img_set_src(img_x, logo2Source);
+            lv_obj_center(img_x);
+            lv_scr_load_anim(scr_x, LV_SCR_LOAD_ANIM_OVER_RIGHT, 500, 0, false);
+            Serial.printf("anh 2 load psram=%d\n", ESP.getFreePsram());
+            t = millis();
+            while (millis() - t < 5000) { bootLvglHandler(); delay(5); }
+        } else {
+            Serial.printf("[SD] Selected boot logo 2 unavailable: %s\n",
+                          displayImageSettings.bootLogo2.c_str());
+        }
+    }
 
     // ── Sang boot screen ──────────────────────────────────────
     lv_scr_load_anim(boot_scr, LV_SCR_LOAD_ANIM_FADE_IN, 500, 0, false);
     t = millis();
     while (millis() - t < 600) { bootLvglHandler(); delay(5); }
     lv_obj_del(logo_scr);
-    lv_obj_del(scr_x);
+    if (scr_x) lv_obj_del(scr_x);
 
     // ====================== BOOT LOG (DỮ LIỆU THẬT) ======================
     char buf[48];
@@ -503,6 +577,37 @@ static lv_obj_t *accessPinMessage = nullptr;
 static int encoderButtonRaw = HIGH;
 static int encoderButtonStable = HIGH;
 static uint32_t encoderButtonChangedAt = 0;
+static constexpr size_t SETTINGS_VISIBLE_ROWS = 6;
+static constexpr size_t SETTINGS_MAX_IMAGES = 32;
+
+enum class EncoderSettingsMode : uint8_t {
+    Closed,
+    Root,
+    ImageChoices,
+    Saved
+};
+
+enum class EncoderSettingsChoice : uint8_t {
+    Logo1,
+    Logo2,
+    IdleMode,
+    IdleImages
+};
+
+static EncoderSettingsMode encoderSettingsMode = EncoderSettingsMode::Closed;
+static EncoderSettingsChoice encoderSettingsChoice = EncoderSettingsChoice::Logo1;
+static RescueDisplayImageSettings pendingDisplayImageSettings;
+static sdpsram::FileEntry settingsImageEntries[SETTINGS_MAX_IMAGES];
+static uint8_t settingsValidImageIndexes[SETTINGS_MAX_IMAGES] = {};
+static size_t settingsValidImageCount = 0;
+static lv_obj_t *encoderSettingsScreen = nullptr;
+static lv_obj_t *encoderSettingsTitle = nullptr;
+static lv_obj_t *encoderSettingsRows[SETTINGS_VISIBLE_ROWS] = {};
+static lv_obj_t *encoderSettingsRowLabels[SETTINGS_VISIBLE_ROWS] = {};
+static lv_obj_t *encoderSettingsStatus = nullptr;
+static int encoderSettingsSelection = 0;
+static int encoderSettingsFirstVisible = 0;
+static String encoderSettingsStatusText;
 
 DRAM_ATTR static const int8_t encoderTransitionTable[16] = {
      0, -1,  1,  0,
@@ -565,7 +670,7 @@ static void updateAccessPinDisplay() {
 
 static void createAccessPinScreen() {
     accessPinScreen = lv_obj_create(nullptr);
-    lv_obj_set_style_bg_color(accessPinScreen, lv_color_hex(0x000033), 0);
+    lv_obj_set_style_bg_color(accessPinScreen, BGCOLOR, 0);
     lv_obj_set_style_bg_opa(accessPinScreen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(accessPinScreen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -654,6 +759,379 @@ static void setLabelTextIfChanged(lv_obj_t *label, const char *text) {
     }
 }
 
+static void pauseIdleForSettings();
+
+static void refreshSettingsImageCatalog() {
+    settingsValidImageCount = 0;
+    if (!isRescueImageCatalogReady()) {
+        encoderSettingsStatusText = "The SD card is not ready";
+        return;
+    }
+
+    const size_t total = sdpsram::ImageStore::listDir(
+        "/ets", settingsImageEntries, SETTINGS_MAX_IMAGES);
+    const size_t shown = total < SETTINGS_MAX_IMAGES ? total : SETTINGS_MAX_IMAGES;
+    for (size_t i = 0; i < shown; ++i) {
+        if (settingsImageEntries[i].valid) {
+            settingsValidImageIndexes[settingsValidImageCount++] = (uint8_t)i;
+        }
+    }
+    encoderSettingsStatusText = settingsValidImageCount
+        ? "Rotate: select   Press: confirm"
+        : "No valid .bin images found in /ets";
+}
+
+static size_t selectedIdleImageCount() {
+    size_t count = 0;
+    for (int start = 0; start < pendingDisplayImageSettings.idleImages.length();) {
+        int end = pendingDisplayImageSettings.idleImages.indexOf('\n', start);
+        if (end < 0) end = pendingDisplayImageSettings.idleImages.length();
+        if (end > start) count++;
+        start = end + 1;
+    }
+    return count;
+}
+
+static bool isIdleImageSelected(const char *name) {
+    int start = 0;
+    const String& names = pendingDisplayImageSettings.idleImages;
+    while (start < names.length()) {
+        int end = names.indexOf('\n', start);
+        if (end < 0) end = names.length();
+        if (names.substring(start, end) == name) return true;
+        start = end + 1;
+    }
+    return false;
+}
+
+static size_t encoderSettingsOptionCount() {
+    switch (encoderSettingsMode) {
+        case EncoderSettingsMode::Root: return 6;
+        case EncoderSettingsMode::ImageChoices:
+            if (encoderSettingsChoice == EncoderSettingsChoice::IdleMode) return 3;
+            if (encoderSettingsChoice == EncoderSettingsChoice::IdleImages) {
+                return settingsValidImageCount + 1;
+            }
+            return settingsValidImageCount + 2;
+        case EncoderSettingsMode::Saved: return 1;
+        case EncoderSettingsMode::Closed: return 0;
+    }
+    return 0;
+}
+
+static String encoderSettingsOptionText(size_t index) {
+    if (encoderSettingsMode == EncoderSettingsMode::Root) {
+        static const char* const options[] = {
+            "Boot logo 1", "Boot logo 2", "Idle slideshow mode",
+            "Select idle images", "Save changes", "Cancel"
+        };
+        return options[index];
+    }
+    if (encoderSettingsMode == EncoderSettingsMode::Saved) {
+        return "Image settings saved";
+    }
+    if (encoderSettingsMode != EncoderSettingsMode::ImageChoices) return "";
+
+    if (encoderSettingsChoice == EncoderSettingsChoice::IdleMode) {
+        if (index == 0) return "Built-in slideshow";
+        if (index == 1) return "Use selected SD images";
+        return "Back";
+    }
+    if (encoderSettingsChoice == EncoderSettingsChoice::IdleImages) {
+        if (index == settingsValidImageCount) return "Back";
+        const char *name = settingsImageEntries[
+            settingsValidImageIndexes[index]].name;
+        return String(isIdleImageSelected(name) ? "[x] " : "[ ] ") + name;
+    }
+    if (index == settingsValidImageCount + 1) return "Back";
+    if (index == 0) {
+        return encoderSettingsChoice == EncoderSettingsChoice::Logo1
+            ? "Built-in logo" : "No second logo";
+    }
+    return settingsImageEntries[
+        settingsValidImageIndexes[index - 1]].name;
+}
+
+static const char* encoderSettingsPageTitle() {
+    if (encoderSettingsMode == EncoderSettingsMode::Root) return "IMAGE SETTINGS";
+    if (encoderSettingsMode == EncoderSettingsMode::Saved) return "SETTINGS SAVED";
+    switch (encoderSettingsChoice) {
+        case EncoderSettingsChoice::Logo1: return "BOOT LOGO 1";
+        case EncoderSettingsChoice::Logo2: return "BOOT LOGO 2";
+        case EncoderSettingsChoice::IdleMode: return "IDLE SOURCE";
+        case EncoderSettingsChoice::IdleImages: return "IDLE IMAGES";
+    }
+    return "IMAGE SETTINGS";
+}
+
+static void renderEncoderSettings() {
+    if (!encoderSettingsScreen) return;
+    lv_label_set_text(encoderSettingsTitle, encoderSettingsPageTitle());
+
+    const size_t count = encoderSettingsOptionCount();
+    if (count == 0) {
+        encoderSettingsSelection = 0;
+        encoderSettingsFirstVisible = 0;
+    } else {
+        if (encoderSettingsSelection < 0) encoderSettingsSelection = (int)count - 1;
+        if (encoderSettingsSelection >= (int)count) encoderSettingsSelection = 0;
+        if (encoderSettingsSelection < encoderSettingsFirstVisible) {
+            encoderSettingsFirstVisible = encoderSettingsSelection;
+        } else if (encoderSettingsSelection >=
+                   encoderSettingsFirstVisible + (int)SETTINGS_VISIBLE_ROWS) {
+            encoderSettingsFirstVisible =
+                encoderSettingsSelection - (int)SETTINGS_VISIBLE_ROWS + 1;
+        }
+    }
+
+    for (size_t row = 0; row < SETTINGS_VISIBLE_ROWS; ++row) {
+        const size_t option = (size_t)encoderSettingsFirstVisible + row;
+        if (option >= count) {
+            lv_obj_add_flag(encoderSettingsRows[row], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_clear_flag(encoderSettingsRows[row], LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(encoderSettingsRowLabels[row],
+                          encoderSettingsOptionText(option).c_str());
+        const bool selected = (int)option == encoderSettingsSelection;
+        lv_obj_set_style_bg_color(
+            encoderSettingsRows[row],
+            selected ? lv_color_hex(0x145A78) : lv_color_hex(0x101D2D), 0);
+        lv_obj_set_style_text_color(
+            encoderSettingsRowLabels[row],
+            selected ? lv_color_hex(0xFFFFFF) : lv_color_hex(0xB8C7D9), 0);
+    }
+
+    String status = encoderSettingsStatusText;
+    if (encoderSettingsMode == EncoderSettingsMode::Root) {
+        if (status.isEmpty()) status = "Rotate: select   Press: open/save";
+    } else if (encoderSettingsMode == EncoderSettingsMode::Saved) {
+        status = "Restart to apply. Press to return.";
+    } else if (encoderSettingsMode == EncoderSettingsMode::ImageChoices &&
+               encoderSettingsChoice == EncoderSettingsChoice::IdleImages) {
+        status = "Selected " + String(selectedIdleImageCount()) +
+                 "/12. Press to toggle; Back to return";
+    }
+    lv_label_set_text(encoderSettingsStatus, status.c_str());
+}
+
+static void createEncoderSettingsScreen() {
+    if (encoderSettingsScreen) return;
+    encoderSettingsScreen = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(encoderSettingsScreen, BGCOLOR, 0);
+    lv_obj_set_style_bg_opa(encoderSettingsScreen, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(encoderSettingsScreen, LV_OBJ_FLAG_SCROLLABLE);
+
+    encoderSettingsTitle = lv_label_create(encoderSettingsScreen);
+    lv_obj_set_style_text_font(encoderSettingsTitle, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(encoderSettingsTitle, lv_color_hex(0x00DDFF), 0);
+    lv_obj_set_pos(encoderSettingsTitle, 8, 14);
+
+    for (size_t i = 0; i < SETTINGS_VISIBLE_ROWS; ++i) {
+        lv_obj_t *row = lv_obj_create(encoderSettingsScreen);
+        encoderSettingsRows[i] = row;
+        lv_obj_set_size(row, 224, 31);
+        lv_obj_set_pos(row, 8, 48 + i * 34);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 5, 0);
+        lv_obj_set_style_pad_hor(row, 8, 0);
+        lv_obj_set_style_pad_ver(row, 5, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *label = lv_label_create(row);
+        encoderSettingsRowLabels[i] = label;
+        lv_obj_set_width(label, 208);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    }
+
+    encoderSettingsStatus = lv_label_create(encoderSettingsScreen);
+    lv_obj_set_width(encoderSettingsStatus, 224);
+    lv_obj_set_style_text_font(encoderSettingsStatus, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(encoderSettingsStatus, lv_color_hex(0x9AABC1), 0);
+    lv_label_set_long_mode(encoderSettingsStatus, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(encoderSettingsStatus, 8, 260);
+}
+
+static void closeEncoderSettings() {
+    encoderSettingsMode = EncoderSettingsMode::Closed;
+    if (ui_scr) lv_scr_load(ui_scr);
+}
+
+static void openEncoderSettings() {
+    if (otaState != 0) return;
+    refreshSettingsImageCatalog();
+    pendingDisplayImageSettings = displayImageSettings;
+    encoderSettingsMode = EncoderSettingsMode::Root;
+    encoderSettingsSelection = 0;
+    encoderSettingsFirstVisible = 0;
+    createEncoderSettingsScreen();
+    pauseIdleForSettings();
+    renderEncoderSettings();
+    lv_scr_load(encoderSettingsScreen);
+}
+
+static void openEncoderSettingsChoice(EncoderSettingsChoice choice) {
+    encoderSettingsChoice = choice;
+    encoderSettingsMode = EncoderSettingsMode::ImageChoices;
+    encoderSettingsSelection = 0;
+    encoderSettingsFirstVisible = 0;
+
+    if (choice == EncoderSettingsChoice::Logo1) {
+        if (!pendingDisplayImageSettings.bootLogo1.isEmpty()) {
+            for (size_t i = 0; i < settingsValidImageCount; ++i) {
+                const char *name = settingsImageEntries[
+                    settingsValidImageIndexes[i]].name;
+                if (pendingDisplayImageSettings.bootLogo1 == name) {
+                    encoderSettingsSelection = (int)i + 1;
+                    break;
+                }
+            }
+        }
+    } else if (choice == EncoderSettingsChoice::Logo2) {
+        if (!pendingDisplayImageSettings.bootLogo2.isEmpty()) {
+            for (size_t i = 0; i < settingsValidImageCount; ++i) {
+                const char *name = settingsImageEntries[
+                    settingsValidImageIndexes[i]].name;
+                if (pendingDisplayImageSettings.bootLogo2 == name) {
+                    encoderSettingsSelection = (int)i + 1;
+                    break;
+                }
+            }
+        }
+    } else if (choice == EncoderSettingsChoice::IdleMode) {
+        encoderSettingsSelection = pendingDisplayImageSettings.useSdIdleImages ? 1 : 0;
+    }
+    renderEncoderSettings();
+}
+
+static void toggleSelectedIdleImage() {
+    const size_t index = (size_t)encoderSettingsSelection;
+    if (index >= settingsValidImageCount) {
+        encoderSettingsMode = EncoderSettingsMode::Root;
+        encoderSettingsSelection = 3;
+        renderEncoderSettings();
+        return;
+    }
+
+    const char *name = settingsImageEntries[
+        settingsValidImageIndexes[index]].name;
+    String updated;
+    bool removed = false;
+    const String& selectedNames = pendingDisplayImageSettings.idleImages;
+    for (int start = 0; start < selectedNames.length();) {
+        int end = selectedNames.indexOf('\n', start);
+        if (end < 0) end = selectedNames.length();
+        const String existing = selectedNames.substring(start, end);
+        if (existing == name) {
+            removed = true;
+        } else if (!existing.isEmpty()) {
+            if (!updated.isEmpty()) updated += '\n';
+            updated += existing;
+        }
+        start = end + 1;
+    }
+    if (!removed) {
+        if (selectedIdleImageCount() >= 12) {
+            encoderSettingsStatusText = "Maximum is 12 selected idle images";
+            renderEncoderSettings();
+            return;
+        }
+        if (!updated.isEmpty()) updated += '\n';
+        updated += name;
+    }
+    pendingDisplayImageSettings.idleImages = updated;
+    renderEncoderSettings();
+}
+
+static void confirmEncoderSettingsChoice() {
+    const size_t selected = (size_t)encoderSettingsSelection;
+    if (encoderSettingsChoice == EncoderSettingsChoice::IdleImages) {
+        toggleSelectedIdleImage();
+        return;
+    }
+
+    if (encoderSettingsChoice == EncoderSettingsChoice::IdleMode) {
+        if (selected == 2) {
+            encoderSettingsMode = EncoderSettingsMode::Root;
+            encoderSettingsSelection = 2;
+        } else {
+            pendingDisplayImageSettings.useSdIdleImages = selected == 1;
+            encoderSettingsStatusText = "";
+            encoderSettingsMode = EncoderSettingsMode::Root;
+            encoderSettingsSelection = 2;
+        }
+        renderEncoderSettings();
+        return;
+    }
+
+    if (selected == settingsValidImageCount + 1) {
+        encoderSettingsMode = EncoderSettingsMode::Root;
+        encoderSettingsSelection =
+            encoderSettingsChoice == EncoderSettingsChoice::Logo1 ? 0 : 1;
+        renderEncoderSettings();
+        return;
+    }
+
+    String value;
+    if (selected > 0) {
+        value = settingsImageEntries[
+            settingsValidImageIndexes[selected - 1]].name;
+    }
+    if (encoderSettingsChoice == EncoderSettingsChoice::Logo1) {
+        pendingDisplayImageSettings.bootLogo1 = value;
+        encoderSettingsSelection = 0;
+    } else {
+        pendingDisplayImageSettings.bootLogo2 = value;
+        encoderSettingsSelection = 1;
+    }
+    encoderSettingsStatusText = "";
+    encoderSettingsMode = EncoderSettingsMode::Root;
+    renderEncoderSettings();
+}
+
+static void confirmEncoderSettings() {
+    if (encoderSettingsMode == EncoderSettingsMode::Saved) {
+        closeEncoderSettings();
+        return;
+    }
+    if (encoderSettingsMode == EncoderSettingsMode::ImageChoices) {
+        confirmEncoderSettingsChoice();
+        return;
+    }
+
+    switch (encoderSettingsSelection) {
+        case 0: openEncoderSettingsChoice(EncoderSettingsChoice::Logo1); break;
+        case 1: openEncoderSettingsChoice(EncoderSettingsChoice::Logo2); break;
+        case 2: openEncoderSettingsChoice(EncoderSettingsChoice::IdleMode); break;
+        case 3: openEncoderSettingsChoice(EncoderSettingsChoice::IdleImages); break;
+        case 4:
+            if (saveDisplayImageSettings(pendingDisplayImageSettings)) {
+                displayImageSettings = pendingDisplayImageSettings;
+                encoderSettingsMode = EncoderSettingsMode::Saved;
+                encoderSettingsStatusText = "";
+            } else {
+                encoderSettingsStatusText =
+                    "Save failed: check SD and select at least one idle image";
+            }
+            renderEncoderSettings();
+            break;
+        case 5: closeEncoderSettings(); break;
+        default: break;
+    }
+}
+
+static void moveEncoderSettingsSelection(int16_t direction) {
+    const size_t count = encoderSettingsOptionCount();
+    if (count == 0) return;
+    encoderSettingsSelection += direction;
+    if (encoderSettingsSelection < 0) encoderSettingsSelection = (int)count - 1;
+    else if (encoderSettingsSelection >= (int)count) encoderSettingsSelection = 0;
+    encoderSettingsStatusText = "";
+    renderEncoderSettings();
+}
+
 static void selectEncoderPage(int16_t direction) {
     int page = (int)encoderPage + direction;
     while (page < 0) page += ENCODER_PAGE_COUNT;
@@ -708,6 +1186,27 @@ static void pollRotaryEncoder() {
             detents++;
         }
         if (buttonPressed) confirmAccessPinDigit();
+        return;
+    }
+
+    if (encoderSettingsMode == EncoderSettingsMode::Saved) {
+        if (buttonPressed) closeEncoderSettings();
+        return;
+    }
+    if (encoderSettingsMode != EncoderSettingsMode::Closed) {
+        while (detents > 0) {
+            moveEncoderSettingsSelection(1);
+            detents--;
+        }
+        while (detents < 0) {
+            moveEncoderSettingsSelection(-1);
+            detents++;
+        }
+        if (buttonPressed) confirmEncoderSettings();
+        return;
+    }
+    if (buttonPressed) {
+        openEncoderSettings();
         return;
     }
 
@@ -864,12 +1363,43 @@ static lv_timer_t *idle_timer = nullptr;
 static lv_obj_t   *rescue_ui_indicator = nullptr;
 static lv_obj_t   *rescue_idle_indicator = nullptr;
 
-static const lv_img_dsc_t* idle_imgs[] = {
-    &q_res, &ribi1, &ribi2, &ribi3, &combine, &IMG_2220Res, &qq
-    
-};
-static const int IDLE_IMG_COUNT = sizeof(idle_imgs) / sizeof(idle_imgs[0]);
+static const lv_img_dsc_t* idle_imgs[12] = {};
+static size_t idle_img_count = 0;
 static int idle_idx = 0;
+
+static void pauseIdleForSettings() {
+    in_idle = false;
+    if (idle_timer) lv_timer_pause(idle_timer);
+}
+
+static void prepareIdleImages() {
+    idle_img_count = 0;
+    if (displayImageSettings.useSdIdleImages) {
+        int start = 0;
+        const String& names = displayImageSettings.idleImages;
+        while (start < names.length() && idle_img_count < 12) {
+            int end = names.indexOf('\n', start);
+            if (end < 0) end = names.length();
+            const String name = names.substring(start, end);
+            const lv_img_dsc_t *image = bigImgs.find(name.c_str());
+            if (image) idle_imgs[idle_img_count++] = image;
+            else Serial.printf("[SD] Selected idle image unavailable: %s\n", name.c_str());
+            start = end + 1;
+        }
+    }
+
+    if (idle_img_count == 0) {
+        static const lv_img_dsc_t* const builtInIdleImages[] = {
+           &IMG_2220Res, &qq
+        };
+        for (const lv_img_dsc_t* image : builtInIdleImages) {
+            idle_imgs[idle_img_count++] = image;
+        }
+        if (displayImageSettings.useSdIdleImages) {
+            Serial.println("[SD] No selected idle images loaded; using built-in slideshow");
+        }
+    }
+}
 
 static String idleClockText() {
     if (!game.connected || game.realTime.isEmpty()) {
@@ -920,12 +1450,14 @@ static void updateIdleStatus() {
 }
 
 static void idle_slide_cb(lv_timer_t *) {
-    idle_idx = (idle_idx + 1) % IDLE_IMG_COUNT;
+    if (idle_img_count < 2) return;
+    idle_idx = (idle_idx + 1) % idle_img_count;
     lv_img_set_src(idle_img, idle_imgs[idle_idx]);
     lv_obj_fade_in(idle_img, 400, 0);
 }
 
 static void createIdleScreen() {
+    prepareIdleImages();
     idle_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(idle_scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(idle_scr, LV_OPA_COVER, 0);
@@ -1013,6 +1545,8 @@ static void updateRescueIndicators() {
 
 // Gọi trong DisplayTask, BÊN TRONG mutex (đọc game.*)
 static void updateScreenMode() {
+    if (encoderSettingsMode != EncoderSettingsMode::Closed) return;
+
     bool want_idle = false;
 #if IDLE_WHEN_DISCONNECTED
     if (!game.connected) want_idle = true;
@@ -1060,7 +1594,7 @@ static lv_obj_t *createEncoderPageLabel(lv_obj_t *parent, lv_coord_t x,
 static void createUI() {
     lv_obj_t *scr = lv_scr_act();
     ui_scr = scr;
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000033), 0);
+    lv_obj_set_style_bg_color(scr, BGCOLOR, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -1068,7 +1602,7 @@ static void createUI() {
     lv_obj_t *hdr = lv_obj_create(scr);
     lv_obj_set_size(hdr, 240, 38);
     lv_obj_set_pos(hdr, 0, 0);
-    lv_obj_set_style_bg_color(hdr, lv_color_hex(0x000033), 0);
+    lv_obj_set_style_bg_color(hdr, BGCOLOR, 0);
     lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(hdr, 0, 0);
     lv_obj_set_style_pad_all(hdr, 0, 0);
@@ -1358,7 +1892,7 @@ static void createUI() {
     encoder_page_panel = lv_obj_create(scr);
     lv_obj_set_pos(encoder_page_panel, 0, 130);
     lv_obj_set_size(encoder_page_panel, 240, 148);
-    lv_obj_set_style_bg_color(encoder_page_panel, lv_color_hex(0x000033), 0);
+    lv_obj_set_style_bg_color(encoder_page_panel, BGCOLOR, 0);
     lv_obj_set_style_bg_opa(encoder_page_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(encoder_page_panel, 0, 0);
     lv_obj_set_style_radius(encoder_page_panel, 0, 0);
@@ -1881,18 +2415,23 @@ void setupDisplay() {
     disp_drv.flush_cb = flush_cb;
     disp_drv.draw_buf = &draw_buf;
     lv_disp_drv_register(&disp_drv);
-
+    loadAssetsFromSd();
     setupRotaryEncoder();
-    createAccessPinScreen();
-    lv_scr_load(accessPinScreen);
-    while (!accessGranted) {
-        pollRotaryEncoder();
-        lv_timer_handler();
-        delay(5);
+    if (configuredAccessPin[0] != '\0') {
+        createAccessPinScreen();
+        lv_scr_load(accessPinScreen);
+        while (!accessGranted) {
+            pollRotaryEncoder();
+            lv_timer_handler();
+            delay(5);
+        }
+    } else {
+        accessGranted = true;
+        Serial.println("[AUTH] Boot PIN disabled");
     }
 
     lv_obj_t *dashboardBaseScreen = lv_obj_create(nullptr);
-    lv_obj_set_style_bg_color(dashboardBaseScreen, lv_color_hex(0x000033), 0);
+    lv_obj_set_style_bg_color(dashboardBaseScreen, BGCOLOR, 0);
     lv_obj_set_style_bg_opa(dashboardBaseScreen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(dashboardBaseScreen, LV_OBJ_FLAG_SCROLLABLE);
     lv_scr_load(dashboardBaseScreen);

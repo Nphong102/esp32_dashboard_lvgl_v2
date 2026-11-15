@@ -27,7 +27,7 @@ extern char        TRUCK_DATA_URL[193];
 #define LOCAL_TIME_ZONE         "ICT-7"
 #define NTP_SERVER_PRIMARY      "pool.ntp.org"
 #define NTP_SERVER_SECONDARY    "time.google.com"
-#define RESCUE_BOOT_PIN         0
+#define RESCUE_BOOT_PIN         14
 #define RESCUE_BOOT_HOLD_MS     2000
 #ifndef BUZZER_PIN
 #define BUZZER_PIN              1

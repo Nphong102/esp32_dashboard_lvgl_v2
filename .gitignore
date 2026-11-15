@@ -10,4 +10,5 @@ platformio.local.ini
 *.jpg
 *.jpeg
 *.bmp
+*.zip
 ets2_minimal.zip
